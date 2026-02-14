@@ -1,3 +1,4 @@
+# app.py
 import os
 import uuid
 import json
@@ -5,7 +6,7 @@ import logging
 import traceback
 import datetime
 from functools import wraps
-from typing import Optional
+from typing import Optional, Any
 
 from flask import Flask, request, jsonify, g
 from flask_pymongo import PyMongo
@@ -15,7 +16,7 @@ from flask_jwt_extended import (
 )
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from marshmallow import Schema, fields, ValidationError, validates, validates_schema
+from marshmallow import Schema, fields, ValidationError, validates
 from pymongo import ASCENDING, errors as pymongo_errors
 from bson.objectid import ObjectId
 import bcrypt
@@ -53,32 +54,37 @@ app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(hours=ACCESS_EXPIRES_HOURS)
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = datetime.timedelta(days=REFRESH_EXPIRES_DAYS)
 
+# PyMongo client
+# Note: you can tune connectTimeoutMS, serverSelectionTimeoutMS via MONGO_URI query params if needed
 mongo = PyMongo(app)
+
+# JWT
 jwt = JWTManager(app)
 
+# Rate limiter
+# Use init_app to avoid signature issues across versions of flask-limiter
 limiter = Limiter(
-    app,
     key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=["200 per day", "50 per hour"],
 )
+limiter.init_app(app)
 
 # ---------- Schemas (Validation) ----------
 
 class RegisterSchema(Schema):
     username = fields.Str(required=True)
     password = fields.Str(required=True, load_only=True)
-    def validate_username(u):
-        if not u or len(u.strip()) < 3:
-            raise ValidationError("username must be at least 3 characters")
+
     @validates("username")
     def check_username(self, value):
+        if not value or len(value.strip()) < 3:
+            raise ValidationError("username must be at least 3 characters")
         if " " in value:
             raise ValidationError("username must not contain spaces")
-        if len(value) < 3:
-            raise ValidationError("username too short")
+
     @validates("password")
     def check_password(self, value):
-        if len(value) < 6:
+        if not value or len(value) < 6:
             raise ValidationError("password must be at least 6 characters")
 
 class LoginSchema(Schema):
@@ -92,7 +98,7 @@ class PaymentSubmitSchema(Schema):
 
     @validates("days")
     def check_days(self, value):
-        if value <= 0 or value > 3650:
+        if value is None or value <= 0 or value > 3650:
             raise ValidationError("days must be between 1 and 3650")
 
 # ---------- Helpers ----------
@@ -110,8 +116,11 @@ def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
+            # ensure jwt present & valid
             verify_jwt_in_request()
             identity = get_jwt_identity()
+            if not identity:
+                return jsonify({"msg": "unauthorized"}), 401
             user = mongo.db.users.find_one({"username": identity})
             if not user:
                 return jsonify({"msg": "unauthorized"}), 401
@@ -132,11 +141,14 @@ def single_session_required(fn):
             verify_jwt_in_request()
             claims = get_jwt()
             identity = get_jwt_identity()
+            if not identity:
+                return jsonify({"msg": "unauthorized"}), 401
             user = mongo.db.users.find_one({"username": identity}, {"session_salt": 1})
             if not user:
                 return jsonify({"msg": "user not found"}), 401
             if claims.get("session_salt") != user.get("session_salt"):
                 return jsonify({"msg": "session invalidated"}), 401
+            # set current user document for handler (fetch full doc)
             g.current_user = mongo.db.users.find_one({"username": identity})
             return fn(*args, **kwargs)
         except Exception:
@@ -154,22 +166,35 @@ def to_objectid(val: str) -> Optional[ObjectId]:
 
 def setup_database():
     try:
+        # ensure indexes
         mongo.db.users.create_index([("username", ASCENDING)], unique=True)
         mongo.db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
         mongo.db.coupons.create_index([("code", ASCENDING)], unique=True)
-        # Optional: ttl index for old logs/temporary data
+        # optional: logs/temporary ttl index example (commented out)
         logger.info("Database indices ensured.")
-    except pymongo_errors.OperationFailure as e:
+    except Exception as e:
         logger.exception("Error creating indices: %s", e)
+        # bubble up in import-time initialization would stop the app so that ops notices
         raise
 
-# Ensure ADMIN_USERNAMES checked: optionally set role admin for existing users
 def seed_admin_roles():
     if not ADMIN_USERNAMES:
         return
     for u in ADMIN_USERNAMES:
-        mongo.db.users.update_one({"username": u}, {"$set": {"role": "admin"}}, upsert=False)
+        try:
+            mongo.db.users.update_one({"username": u}, {"$set": {"role": "admin"}}, upsert=False)
+        except Exception:
+            logger.exception("Failed applying admin role for %s", u)
     logger.info("Admin usernames applied to existing users (if present).")
+
+# call at import/startup so indices exist before handling requests
+try:
+    setup_database()
+    seed_admin_roles()
+except Exception:
+    logger.exception("Database setup failed at startup")
+    # Depending on deployment preference, you may want to re-raise to prevent startup.
+    # For now, continue so process doesn't crash unexpectedly in some environments.
 
 # ---------- Error Handling ----------
 
@@ -251,10 +276,17 @@ def login():
 @jwt_required(refresh=True)
 def refresh():
     try:
+        # verify jwt and ensure the session_salt still matches DB (prevent using old refresh token)
+        verify_jwt_in_request()
+        claims = get_jwt()
         identity = get_jwt_identity()
-        user = mongo.db.users.find_one({"username": identity})
+        if not identity:
+            return jsonify({"msg": "unauthorized"}), 401
+        user = mongo.db.users.find_one({"username": identity}, {"session_salt": 1})
         if not user:
             return jsonify({"msg": "user not found"}), 404
+        if claims.get("session_salt") != user.get("session_salt"):
+            return jsonify({"msg": "refresh token invalidated"}), 401
         access = create_access_token(identity=identity, additional_claims={"session_salt": user.get("session_salt")})
         return jsonify({"access_token": access}), 200
     except Exception:
@@ -289,11 +321,10 @@ def verify_tx_on_chain(tx_hash: str) -> bool:
     Placeholder for blockchain transaction verification.
     In production, integrate with the relevant chain explorer or node RPC,
     check confirmations, network, amounts etc.
+    Minimal sanity check used here.
     """
-    # Minimal sanity check:
     if not tx_hash or len(tx_hash) < 8:
         return False
-    # Real verification must be implemented per-chain.
     return True
 
 @app.route("/payment/submit", methods=["POST"])
@@ -330,7 +361,7 @@ def submit_payment():
         if not tx_hash:
             return jsonify({"msg": "tx_hash or coupon required"}), 400
 
-        # basic tx_hash validation
+        # basic tx_hash validation + uniqueness
         if mongo.db.transactions.find_one({"tx_hash": tx_hash}):
             return jsonify({"msg": "tx_hash already submitted"}), 400
 
@@ -348,19 +379,21 @@ def submit_payment():
             "status": status,
             "created_at": datetime.datetime.utcnow()
         }
-        inserted = mongo.db.transactions.insert_one(tx_doc)
+        try:
+            inserted = mongo.db.transactions.insert_one(tx_doc)
+        except pymongo_errors.DuplicateKeyError:
+            # race: another request inserted same tx_hash concurrently
+            return jsonify({"msg": "tx_hash already exists"}), 400
+
         tx_id = str(inserted.inserted_id)
-        # Admins will have to approve via admin endpoint
         return jsonify({"msg": "payment submitted", "tx_id": tx_id, "status": status}), 200
     except ValidationError as ve:
         return jsonify({"msg": "validation failed", "errors": ve.messages}), 400
-    except pymongo_errors.DuplicateKeyError:
-        return jsonify({"msg": "tx_hash already exists"}), 400
     except Exception:
         logger.exception("submit_payment error")
         return jsonify({"msg": "internal error"}), 500
 
-# Admin endpoints to approve/reject payments (no external bot dependency)
+# Admin endpoints to approve/reject payments
 
 @app.route("/admin/transactions/<tx_id>/approve", methods=["POST"])
 @jwt_required()
@@ -420,6 +453,8 @@ def admin_list_transactions():
             t["user_id"] = str(t["user_id"])
             if "processed_at" in t and isinstance(t["processed_at"], datetime.datetime):
                 t["processed_at"] = t["processed_at"].isoformat()
+            if "created_at" in t and isinstance(t["created_at"], datetime.datetime):
+                t["created_at"] = t["created_at"].isoformat()
             out.append(t)
         return jsonify({"transactions": out}), 200
     except Exception:
@@ -434,7 +469,7 @@ def admin_list_transactions():
 def create_coupon():
     try:
         payload = request.get_json(force=True)
-        code = payload.get("code", "").strip()
+        code = (payload.get("code") or "").strip()
         bonus_days = int(payload.get("bonus_days", 0))
         expires_at = payload.get("expires_at")  # ISO format expected
         max_uses = payload.get("max_uses")
@@ -444,7 +479,7 @@ def create_coupon():
             "code": code,
             "bonus_days": bonus_days,
             "uses": 0,
-            "max_uses": int(max_uses) if max_uses else None,
+            "max_uses": int(max_uses) if max_uses not in (None, "") else None,
             "created_at": datetime.datetime.utcnow()
         }
         if expires_at:
@@ -471,6 +506,8 @@ def list_coupons():
             c["_id"] = str(c["_id"])
             if "expires_at" in c and isinstance(c["expires_at"], datetime.datetime):
                 c["expires_at"] = c["expires_at"].isoformat()
+            if "created_at" in c and isinstance(c["created_at"], datetime.datetime):
+                c["created_at"] = c["created_at"].isoformat()
             out.append(c)
         return jsonify({"coupons": out}), 200
     except Exception:
@@ -483,14 +520,11 @@ def list_coupons():
 def ping():
     return jsonify({"msg": "pong"}), 200
 
-# ---------- Startup ----------
-
+# ---------- Startup (dev) ----------
 if __name__ == "__main__":
     try:
-        setup_database()
-        seed_admin_roles()
-        # Do not start background threads here in a single-process WSGI; prefer external schedulers.
         logger.info("Starting Two Manga API on port %s", APP_PORT)
+        # In production prefer a WSGI server (gunicorn/uvicorn with multiple workers)
         app.run(host="0.0.0.0", port=APP_PORT, debug=False)
     except Exception:
         logger.exception("Failed to start application")
