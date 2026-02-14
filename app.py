@@ -1,269 +1,497 @@
 import os
-import datetime
-import bcrypt
-import requests
-import json
 import uuid
-import threading
-import time
+import json
+import logging
+import traceback
+import datetime
 from functools import wraps
-from flask import Flask, request, jsonify
-from flask_pymongo import PyMongo
-from flask_cors import CORS 
-from flask_jwt_extended import (
-    create_access_token, create_refresh_token, jwt_required, 
-    get_jwt_identity, JWTManager, get_jwt, verify_jwt_in_request
-)
-from bson.objectid import ObjectId
-from pymongo import ASCENDING, DESCENDING
-from dotenv import load_dotenv
+from typing import Optional
 
-# --- بارگذاری تنظیمات محیطی ---
-load_dotenv()
+from flask import Flask, request, jsonify, g
+from flask_pymongo import PyMongo
+from flask_jwt_extended import (
+    JWTManager, create_access_token, create_refresh_token,
+    jwt_required, get_jwt_identity, get_jwt, verify_jwt_in_request
+)
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from marshmallow import Schema, fields, ValidationError, validates, validates_schema
+from pymongo import ASCENDING, errors as pymongo_errors
+from bson.objectid import ObjectId
+import bcrypt
+
+# ---------- Configuration & Logging ----------
+
+def getenv_required(key: str, default: Optional[str] = None) -> str:
+    v = os.getenv(key, default)
+    if not v:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return v
+
+# Required environment variables (will raise if missing)
+MONGO_URI = getenv_required("MONGO_URI")
+JWT_SECRET_KEY = getenv_required("JWT_SECRET_KEY")
+APP_PORT = int(os.getenv("PORT", "5001"))
+ADMIN_USERNAMES = [u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip()]
+
+# Optional tuning
+ACCESS_EXPIRES_HOURS = int(os.getenv("ACCESS_EXPIRES_HOURS", "4"))
+REFRESH_EXPIRES_DAYS = int(os.getenv("REFRESH_EXPIRES_DAYS", "30"))
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+)
+logger = logging.getLogger("two-manga-backend")
+
+# ---------- Flask App & Extensions ----------
 
 app = Flask(__name__)
-
-# --- پیکربندی CORS هوشمند ---
-raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else "*"
-CORS(app, resources={r"/*": {"origins": allowed_origins}}) 
-
-# --- پیکربندی اپلیکیشن ---
-app.config["MONGO_URI"] = os.getenv("MONGO_URI")
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = datetime.timedelta(hours=4)
-app.config['JWT_REFRESH_TOKEN_EXPIRES'] = datetime.timedelta(days=30)
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = [idx.strip() for idx in os.getenv("ADMIN_IDS", "").split(",") if idx.strip()]
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
-APP_PORT = int(os.getenv("PORT", 5001))
+app.config["MONGO_URI"] = MONGO_URI
+app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(hours=ACCESS_EXPIRES_HOURS)
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = datetime.timedelta(days=REFRESH_EXPIRES_DAYS)
 
 mongo = PyMongo(app)
 jwt = JWTManager(app)
 
-# --- [توابع کمکی دیتابیس و امنیت] ---
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
-def setup_database():
-    """ایجاد ایندکس‌ها برای سرعت و جلوگیری از دیتای تکراری"""
-    with app.app_context():
-        try:
-            mongo.db.users.create_index([("username", ASCENDING)], unique=True)
-            mongo.db.users.create_index([("telegram_id", ASCENDING)], unique=True)
-            mongo.db.transactions.create_index([("tx_hash", ASCENDING)], unique=True)
-            mongo.db.coupons.create_index([("code", ASCENDING)], unique=True)
-            print("✅ دیتابیس با موفقیت پیکربندی و ایندکس‌گذاری شد.")
-        except Exception as e:
-            print(f"❌ خطا در ایندکس‌گذاری دیتابیس: {e}")
+# ---------- Schemas (Validation) ----------
 
-def single_session_required(fn):
-    """جلوگیری از استفاده همزمان چند نفر از یک اکانت"""
+class RegisterSchema(Schema):
+    username = fields.Str(required=True)
+    password = fields.Str(required=True, load_only=True)
+    def validate_username(u):
+        if not u or len(u.strip()) < 3:
+            raise ValidationError("username must be at least 3 characters")
+    @validates("username")
+    def check_username(self, value):
+        if " " in value:
+            raise ValidationError("username must not contain spaces")
+        if len(value) < 3:
+            raise ValidationError("username too short")
+    @validates("password")
+    def check_password(self, value):
+        if len(value) < 6:
+            raise ValidationError("password must be at least 6 characters")
+
+class LoginSchema(Schema):
+    username = fields.Str(required=True)
+    password = fields.Str(required=True, load_only=True)
+
+class PaymentSubmitSchema(Schema):
+    tx_hash = fields.Str(required=False, allow_none=True)
+    coupon_code = fields.Str(required=False, allow_none=True)
+    days = fields.Int(required=True)
+
+    @validates("days")
+    def check_days(self, value):
+        if value <= 0 or value > 3650:
+            raise ValidationError("days must be between 1 and 3650")
+
+# ---------- Helpers ----------
+
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def check_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             verify_jwt_in_request()
-            user = mongo.db.users.find_one({"username": get_jwt_identity()}, {"session_salt": 1})
-            if not user or get_jwt().get("session_salt") != user.get("session_salt"):
-                return jsonify({"msg": "سشن شما منقضی شده یا دستگاه دیگری وارد شده است"}), 401
-            return fn(*args, **kwargs)
-        except:
-            return jsonify({"msg": "خطا در احراز هویت"}), 401
+            identity = get_jwt_identity()
+            user = mongo.db.users.find_one({"username": identity})
+            if not user:
+                return jsonify({"msg": "unauthorized"}), 401
+            username_lower = identity.lower()
+            if user.get("role") == "admin" or username_lower in ADMIN_USERNAMES:
+                g.current_user = user
+                return fn(*args, **kwargs)
+            return jsonify({"msg": "admin required"}), 403
+        except Exception:
+            logger.exception("admin_required failure")
+            return jsonify({"msg": "authentication failed"}), 401
     return wrapper
 
-def send_tg(chat_id, text, markup=None):
-    """ارسال پیام به تلگرام"""
-    if not TELEGRAM_BOT_TOKEN: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
-    if markup: payload['reply_markup'] = json.dumps(markup)
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+def single_session_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            verify_jwt_in_request()
+            claims = get_jwt()
+            identity = get_jwt_identity()
+            user = mongo.db.users.find_one({"username": identity}, {"session_salt": 1})
+            if not user:
+                return jsonify({"msg": "user not found"}), 401
+            if claims.get("session_salt") != user.get("session_salt"):
+                return jsonify({"msg": "session invalidated"}), 401
+            g.current_user = mongo.db.users.find_one({"username": identity})
+            return fn(*args, **kwargs)
+        except Exception:
+            logger.exception("single_session_required error")
+            return jsonify({"msg": "authentication error"}), 401
+    return wrapper
 
-# --- [بخش API های احراز هویت و کاربر] ---
-
-@app.route('/')
-def home():
-    return "🚀 Two Manga API is running in Production Mode!", 200
-
-@app.route('/auth/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    u = data.get('username', '').strip().lower()
-    p = data.get('password')
-    t = data.get('telegram_id', '').strip()
-
-    if not all([u, p, t]) or len(p) < 6:
-        return jsonify({"msg": "اطلاعات ناقص است یا رمز عبور بسیار کوتاه است"}), 400
-    
-    hp = bcrypt.hashpw(p.encode('utf-8'), bcrypt.gensalt())
+def to_objectid(val: str) -> Optional[ObjectId]:
     try:
-        mongo.db.users.insert_one({
-            'username': u, 'password': hp, 'telegram_id': t,
-            'expiryDate': None, 'session_salt': str(uuid.uuid4()),
-            'total_purchases': 0, 'created_at': datetime.datetime.utcnow()
-        })
-        return jsonify({"msg": "ثبت‌نام با موفقیت انجام شد"}), 201
-    except:
-        return jsonify({"msg": "نام کاربری یا آیدی تلگرام قبلاً ثبت شده است"}), 409
+        return ObjectId(val)
+    except Exception:
+        return None
 
-@app.route('/auth/login', methods=['POST'])
+# ---------- Database Setup ----------
+
+def setup_database():
+    try:
+        mongo.db.users.create_index([("username", ASCENDING)], unique=True)
+        mongo.db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
+        mongo.db.coupons.create_index([("code", ASCENDING)], unique=True)
+        # Optional: ttl index for old logs/temporary data
+        logger.info("Database indices ensured.")
+    except pymongo_errors.OperationFailure as e:
+        logger.exception("Error creating indices: %s", e)
+        raise
+
+# Ensure ADMIN_USERNAMES checked: optionally set role admin for existing users
+def seed_admin_roles():
+    if not ADMIN_USERNAMES:
+        return
+    for u in ADMIN_USERNAMES:
+        mongo.db.users.update_one({"username": u}, {"$set": {"role": "admin"}}, upsert=False)
+    logger.info("Admin usernames applied to existing users (if present).")
+
+# ---------- Error Handling ----------
+
+@app.errorhandler(ValidationError)
+def handle_validation_error(err):
+    return jsonify({"msg": "validation error", "errors": err.messages}), 400
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"msg": "endpoint not found"}), 404
+
+@app.errorhandler(Exception)
+def global_exception_handler(e):
+    tb = traceback.format_exc()
+    logger.error("Unhandled exception: %s\n%s", str(e), tb)
+    return jsonify({"msg": "internal server error"}), 500
+
+# ---------- Auth & User Routes ----------
+
+@app.route("/")
+def health():
+    return jsonify({"status": "ok", "server": "Two Manga API"}), 200
+
+@app.route("/auth/register", methods=["POST"])
+@limiter.limit("5 per minute")
+def register():
+    try:
+        payload = request.get_json(force=True)
+        data = RegisterSchema().load(payload)
+        username = data["username"].strip().lower()
+        password = data["password"]
+        existing = mongo.db.users.find_one({"username": username})
+        if existing:
+            return jsonify({"msg": "username already exists"}), 409
+        hashed = hash_password(password)
+        now = datetime.datetime.utcnow()
+        user_doc = {
+            "username": username,
+            "password": hashed,
+            "created_at": now,
+            "session_salt": str(uuid.uuid4()),
+            "role": "admin" if username in ADMIN_USERNAMES else "user",
+            "expiryDate": None,
+            "total_purchases": 0
+        }
+        mongo.db.users.insert_one(user_doc)
+        return jsonify({"msg": "registered"}), 201
+    except ValidationError as ve:
+        return jsonify({"msg": "validation failed", "errors": ve.messages}), 400
+    except pymongo_errors.DuplicateKeyError:
+        return jsonify({"msg": "username already exists"}), 409
+    except Exception:
+        logger.exception("register error")
+        return jsonify({"msg": "internal error"}), 500
+
+@app.route("/auth/login", methods=["POST"])
+@limiter.limit("10 per minute")
 def login():
-    data = request.get_json()
-    u, p = data.get('username','').strip().lower(), data.get('password')
-    user = mongo.db.users.find_one({'username': u})
-    
-    if user and bcrypt.checkpw(p.encode('utf-8'), user['password']):
+    try:
+        payload = request.get_json(force=True)
+        data = LoginSchema().load(payload)
+        username = data["username"].strip().lower()
+        password = data["password"]
+        user = mongo.db.users.find_one({"username": username})
+        if not user or not check_password(password, user["password"]):
+            return jsonify({"msg": "invalid credentials"}), 401
         salt = str(uuid.uuid4())
-        mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'session_salt': salt}})
-        at = create_access_token(identity=u, additional_claims={"session_salt": salt})
-        rt = create_refresh_token(identity=u, additional_claims={"session_salt": salt})
-        return jsonify(access_token=at, refresh_token=rt), 200
-    
-    return jsonify({"msg": "نام کاربری یا رمز عبور اشتباه است"}), 401
+        mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"session_salt": salt}})
+        access = create_access_token(identity=username, additional_claims={"session_salt": salt})
+        refresh = create_refresh_token(identity=username, additional_claims={"session_salt": salt})
+        return jsonify({"access_token": access, "refresh_token": refresh}), 200
+    except ValidationError as ve:
+        return jsonify({"msg": "validation failed", "errors": ve.messages}), 400
+    except Exception:
+        logger.exception("login error")
+        return jsonify({"msg": "internal error"}), 500
 
-@app.route('/auth/refresh', methods=['POST'])
+@app.route("/auth/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():
-    u = get_jwt_identity()
-    user = mongo.db.users.find_one({"username": u}, {"session_salt": 1})
-    if not user: return jsonify({"msg": "کاربر یافت نشد"}), 401
-    at = create_access_token(identity=u, additional_claims={"session_salt": user['session_salt']})
-    return jsonify(access_token=at), 200
+    try:
+        identity = get_jwt_identity()
+        user = mongo.db.users.find_one({"username": identity})
+        if not user:
+            return jsonify({"msg": "user not found"}), 404
+        access = create_access_token(identity=identity, additional_claims={"session_salt": user.get("session_salt")})
+        return jsonify({"access_token": access}), 200
+    except Exception:
+        logger.exception("refresh error")
+        return jsonify({"msg": "internal error"}), 500
 
-@app.route('/api/user/status', methods=['GET'])
+@app.route("/api/user/status", methods=["GET"])
 @jwt_required()
 @single_session_required
 def get_status():
-    user = mongo.db.users.find_one({'username': get_jwt_identity()})
-    now = datetime.datetime.utcnow()
-    exp = user.get('expiryDate')
-    is_premium = exp and exp > now
-    
-    return jsonify({
-        "username": user['username'],
-        "is_premium": bool(is_premium),
-        "days_left": (exp - now).days if is_premium else 0,
-        "expiry_date": exp.isoformat() if exp else None,
-        "total_purchases": user.get('total_purchases', 0)
-    }), 200
+    try:
+        user = g.current_user
+        now = datetime.datetime.utcnow()
+        exp = user.get("expiryDate")
+        is_premium = bool(exp and exp > now)
+        days_left = (exp - now).days if is_premium else 0
+        return jsonify({
+            "username": user["username"],
+            "is_premium": is_premium,
+            "days_left": days_left,
+            "expiry_date": exp.isoformat() if exp else None,
+            "total_purchases": user.get("total_purchases", 0)
+        }), 200
+    except Exception:
+        logger.exception("get_status error")
+        return jsonify({"msg": "internal error"}), 500
 
-# --- [بخش مالی و پرداخت] ---
+# ---------- Payments & Coupons ----------
 
-@app.route('/payment/submit', methods=['POST'])
+def verify_tx_on_chain(tx_hash: str) -> bool:
+    """
+    Placeholder for blockchain transaction verification.
+    In production, integrate with the relevant chain explorer or node RPC,
+    check confirmations, network, amounts etc.
+    """
+    # Minimal sanity check:
+    if not tx_hash or len(tx_hash) < 8:
+        return False
+    # Real verification must be implemented per-chain.
+    return True
+
+@app.route("/payment/submit", methods=["POST"])
 @jwt_required()
 @single_session_required
+@limiter.limit("10 per hour")
 def submit_payment():
-    u_name = get_jwt_identity()
-    user = mongo.db.users.find_one({'username': u_name})
-    data = request.get_json()
-    tx_hash = data.get('tx_hash','').strip()
-    coupon = data.get('coupon_code','').strip()
-    days = int(data.get('days', 30))
-    
-    # بررسی کوپن هدیه
-    if coupon:
-        c = mongo.db.coupons.find_one({"code": coupon})
-        if c:
+    try:
+        payload = request.get_json(force=True)
+        data = PaymentSubmitSchema().load(payload)
+        user = g.current_user
+        tx_hash = (data.get("tx_hash") or "").strip() or None
+        coupon = (data.get("coupon_code") or "").strip() or None
+        days = int(data.get("days"))
+
+        if coupon:
+            c = mongo.db.coupons.find_one({"code": coupon})
+            if not c:
+                return jsonify({"msg": "invalid coupon"}), 400
             now = datetime.datetime.utcnow()
-            start = user['expiryDate'] if (user.get('expiryDate') and user['expiryDate'] > now) else now
-            new_exp = start + datetime.timedelta(days=c['bonus_days'])
-            mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'expiryDate': new_exp}})
-            mongo.db.coupons.delete_one({"_id": c['_id']})
-            send_tg(user['telegram_id'], f"🎁 **کد هدیه فعال شد!**\nاعتبار جدید تا: `{new_exp.strftime('%Y-%m-%d')}`")
-            return jsonify({"msg": "کد هدیه با موفقیت اعمال شد"}), 200
-        return jsonify({"msg": "کد هدیه نامعتبر یا منقضی است"}), 400
+            # coupon usage constraints
+            if c.get("expires_at") and c["expires_at"] < now:
+                return jsonify({"msg": "coupon expired"}), 400
+            max_uses = c.get("max_uses")
+            uses = c.get("uses", 0)
+            if max_uses and uses >= max_uses:
+                return jsonify({"msg": "coupon use limit reached"}), 400
+            start = user.get("expiryDate") if (user.get("expiryDate") and user["expiryDate"] > now) else now
+            new_exp = start + datetime.timedelta(days=c.get("bonus_days", days))
+            mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"expiryDate": new_exp}, "$inc": {"total_purchases": 1}})
+            mongo.db.coupons.update_one({"_id": c["_id"]}, {"$inc": {"uses": 1}})
+            return jsonify({"msg": "coupon applied", "expiry_date": new_exp.isoformat()}), 200
 
-    # بررسی هش تراکنش
-    if not tx_hash or len(tx_hash) < 10 or mongo.db.transactions.find_one({"tx_hash": tx_hash}):
-        return jsonify({"msg": "هش تراکنش نامعتبر یا تکراری است"}), 400
+        if not tx_hash:
+            return jsonify({"msg": "tx_hash or coupon required"}), 400
 
-    tx_id = mongo.db.transactions.insert_one({
-        "user_id": user['_id'], "username": u_name, "tx_hash": tx_hash,
-        "days": days, "status": "pending", "created_at": datetime.datetime.utcnow()
-    }).inserted_id
+        # basic tx_hash validation
+        if mongo.db.transactions.find_one({"tx_hash": tx_hash}):
+            return jsonify({"msg": "tx_hash already submitted"}), 400
 
-    # دکمه‌های شیک مدیریت برای ادمین
-    kb = {"inline_keyboard": [
-        [{"text": "✅ تایید پرداخت", "callback_data": f"appr:{tx_id}"}],
-        [{"text": "❌ رد درخواست", "callback_data": f"rejt:{tx_id}"}]
-    ]}
-    
-    for admin in ADMIN_IDS:
-        send_tg(admin, f"💰 **درخواست ارتقا حساب**\n\n👤 کاربر: `{u_name}`\n🗓 پلن: `{days} روزه`\n🔗 هش: `{tx_hash}`", kb)
-    
-    return jsonify({"msg": "درخواست شما ثبت شد و پس از تایید ادمین فعال خواهد شد"}), 200
+        if not verify_tx_on_chain(tx_hash):
+            # Keep entry as pending but flag as unverifiable (admin will investigate)
+            status = "pending_verification"
+        else:
+            status = "pending"
 
-# --- [موتور پردازش پس‌زمینه (بات و مانیتورینگ)] ---
+        tx_doc = {
+            "user_id": user["_id"],
+            "username": user["username"],
+            "tx_hash": tx_hash,
+            "days": days,
+            "status": status,
+            "created_at": datetime.datetime.utcnow()
+        }
+        inserted = mongo.db.transactions.insert_one(tx_doc)
+        tx_id = str(inserted.inserted_id)
+        # Admins will have to approve via admin endpoint
+        return jsonify({"msg": "payment submitted", "tx_id": tx_id, "status": status}), 200
+    except ValidationError as ve:
+        return jsonify({"msg": "validation failed", "errors": ve.messages}), 400
+    except pymongo_errors.DuplicateKeyError:
+        return jsonify({"msg": "tx_hash already exists"}), 400
+    except Exception:
+        logger.exception("submit_payment error")
+        return jsonify({"msg": "internal error"}), 500
 
-def telegram_bot_engine():
-    """شنود دکمه‌های ادمین و دستورات تلگرام"""
-    print("🤖 Bot Engine is running...")
-    offset = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            resp = requests.get(url, timeout=25).json()
-            if not resp.get("ok"): continue
-            
-            for update in resp.get("result", []):
-                offset = update["update_id"] + 1
-                if "callback_query" in update:
-                    cq = update["callback_query"]
-                    data = cq["data"]
-                    action = "approve" if data.startswith("appr:") else "reject"
-                    tx_id_str = data.split(":")[1]
-                    
-                    with app.app_context():
-                        tx = mongo.db.transactions.find_one({'_id': ObjectId(tx_id_str), 'status': 'pending'})
-                        if tx:
-                            user = mongo.db.users.find_one({'_id': tx['user_id']})
-                            if action == "approve":
-                                now = datetime.datetime.utcnow()
-                                start = user['expiryDate'] if (user.get('expiryDate') and user['expiryDate'] > now) else now
-                                new_exp = start + datetime.timedelta(days=tx['days'])
-                                
-                                mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'expiryDate': new_exp}, '$inc': {'total_purchases': 1}})
-                                mongo.db.transactions.update_one({'_id': tx['_id']}, {'$set': {'status': 'approved', 'processed_at': now}})
-                                
-                                send_tg(user['telegram_id'], f"✅ **پرداخت تایید شد!**\nاشتراک شما تا تاریخ `{new_exp.strftime('%Y-%m-%d')}` فعال شد.")
-                                if LOG_CHANNEL_ID:
-                                    send_tg(LOG_CHANNEL_ID, f"📢 #فروش\nکاربر: `{user['username']}`\nمدت: {tx['days']} روز")
-                            else:
-                                mongo.db.transactions.update_one({'_id': tx['_id']}, {'$set': {'status': 'rejected'}})
-                                send_tg(user['telegram_id'], "❌ **پرداخت رد شد**\nتراکنش شما توسط ادمین تایید نشد. در صورت نیاز به پشتیبانی پیام دهید.")
-                    
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", 
-                                 json={"callback_query_id": cq["id"], "text": "انجام شد"})
-        except: time.sleep(5)
+# Admin endpoints to approve/reject payments (no external bot dependency)
 
-def health_monitor():
-    """گزارش سلامت دیتابیس و آمار روزانه"""
-    while True:
-        time.sleep(86400) # هر ۲۴ ساعت
-        with app.app_context():
+@app.route("/admin/transactions/<tx_id>/approve", methods=["POST"])
+@jwt_required()
+@admin_required
+def admin_approve_transaction(tx_id):
+    try:
+        oid = to_objectid(tx_id)
+        if not oid:
+            return jsonify({"msg": "invalid tx id"}), 400
+        tx = mongo.db.transactions.find_one({"_id": oid, "status": {"$in": ["pending", "pending_verification"]}})
+        if not tx:
+            return jsonify({"msg": "transaction not found or already processed"}), 404
+        user = mongo.db.users.find_one({"_id": tx["user_id"]})
+        if not user:
+            return jsonify({"msg": "associated user not found"}), 404
+        now = datetime.datetime.utcnow()
+        start = user.get("expiryDate") if (user.get("expiryDate") and user["expiryDate"] > now) else now
+        new_exp = start + datetime.timedelta(days=tx.get("days", 0))
+        mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"expiryDate": new_exp}, "$inc": {"total_purchases": 1}})
+        mongo.db.transactions.update_one({"_id": tx["_id"]}, {"$set": {"status": "approved", "processed_at": now, "approved_by": g.current_user["username"]}})
+        return jsonify({"msg": "transaction approved", "new_expiry": new_exp.isoformat()}), 200
+    except Exception:
+        logger.exception("admin_approve_transaction error")
+        return jsonify({"msg": "internal error"}), 500
+
+@app.route("/admin/transactions/<tx_id>/reject", methods=["POST"])
+@jwt_required()
+@admin_required
+def admin_reject_transaction(tx_id):
+    try:
+        reason = (request.get_json(silent=True) or {}).get("reason", "")
+        oid = to_objectid(tx_id)
+        if not oid:
+            return jsonify({"msg": "invalid tx id"}), 400
+        tx = mongo.db.transactions.find_one({"_id": oid, "status": {"$in": ["pending", "pending_verification"]}})
+        if not tx:
+            return jsonify({"msg": "transaction not found or already processed"}), 404
+        mongo.db.transactions.update_one({"_id": tx["_id"]}, {"$set": {"status": "rejected", "rejected_at": datetime.datetime.utcnow(), "rejected_by": g.current_user["username"], "reject_reason": reason}})
+        return jsonify({"msg": "transaction rejected"}), 200
+    except Exception:
+        logger.exception("admin_reject_transaction error")
+        return jsonify({"msg": "internal error"}), 500
+
+@app.route("/admin/transactions", methods=["GET"])
+@jwt_required()
+@admin_required
+def admin_list_transactions():
+    try:
+        status = request.args.get("status")
+        q = {}
+        if status:
+            q["status"] = status
+        cursor = mongo.db.transactions.find(q).sort("created_at", -1).limit(200)
+        out = []
+        for t in cursor:
+            t["_id"] = str(t["_id"])
+            t["user_id"] = str(t["user_id"])
+            if "processed_at" in t and isinstance(t["processed_at"], datetime.datetime):
+                t["processed_at"] = t["processed_at"].isoformat()
+            out.append(t)
+        return jsonify({"transactions": out}), 200
+    except Exception:
+        logger.exception("admin_list_transactions error")
+        return jsonify({"msg": "internal error"}), 500
+
+# ---------- Coupons Management (Admin) ----------
+
+@app.route("/admin/coupons", methods=["POST"])
+@jwt_required()
+@admin_required
+def create_coupon():
+    try:
+        payload = request.get_json(force=True)
+        code = payload.get("code", "").strip()
+        bonus_days = int(payload.get("bonus_days", 0))
+        expires_at = payload.get("expires_at")  # ISO format expected
+        max_uses = payload.get("max_uses")
+        if not code or bonus_days <= 0:
+            return jsonify({"msg": "invalid coupon payload"}), 400
+        doc = {
+            "code": code,
+            "bonus_days": bonus_days,
+            "uses": 0,
+            "max_uses": int(max_uses) if max_uses else None,
+            "created_at": datetime.datetime.utcnow()
+        }
+        if expires_at:
             try:
-                total_u = mongo.db.users.count_documents({})
-                sales_24 = mongo.db.transactions.count_documents({"status": "approved", "processed_at": {"$gte": datetime.datetime.utcnow() - datetime.timedelta(hours=24)}})
-                report = f"📊 **گزارش روزانه سیستم**\n\n👥 کل کاربران: `{total_u}`\n💰 فروش ۲۴ ساعت: `{sales_24}`\n✅ وضعیت دیتابیس: `OK`"
-                for admin in ADMIN_IDS: send_tg(admin, report)
-            except Exception as e:
-                for admin in ADMIN_IDS: send_tg(admin, f"⚠️ خطا در مانیتورینگ: {e}")
+                doc["expires_at"] = datetime.datetime.fromisoformat(expires_at)
+            except Exception:
+                return jsonify({"msg": "invalid expires_at format, use ISO"}), 400
+        mongo.db.coupons.insert_one(doc)
+        return jsonify({"msg": "coupon created"}), 201
+    except pymongo_errors.DuplicateKeyError:
+        return jsonify({"msg": "coupon already exists"}), 409
+    except Exception:
+        logger.exception("create_coupon error")
+        return jsonify({"msg": "internal error"}), 500
 
-# --- [مدیریت خطاهای سرور] ---
+@app.route("/admin/coupons", methods=["GET"])
+@jwt_required()
+@admin_required
+def list_coupons():
+    try:
+        cursor = mongo.db.coupons.find().sort("created_at", -1).limit(200)
+        out = []
+        for c in cursor:
+            c["_id"] = str(c["_id"])
+            if "expires_at" in c and isinstance(c["expires_at"], datetime.datetime):
+                c["expires_at"] = c["expires_at"].isoformat()
+            out.append(c)
+        return jsonify({"coupons": out}), 200
+    except Exception:
+        logger.exception("list_coupons error")
+        return jsonify({"msg": "internal error"}), 500
 
-@app.errorhandler(Exception)
-def handle_global_exception(e):
-    if hasattr(e, 'code') and e.code in [404, 405]: return jsonify({"msg": "Endpoint not found"}), e.code
-    err_trace = traceback.format_exc()
-    for admin in ADMIN_IDS:
-        send_tg(admin, f"🆘 **CRITICAL BACKEND ERROR**\n`{str(e)}`")
-    print(err_trace)
-    return jsonify({"msg": "خطای داخلی سرور"}), 500
+# ---------- Utilities ----------
 
-if __name__ == '__main__':
-    setup_database()
-    # شروع تردها برای پردازش همزمان
-    threading.Thread(target=telegram_bot_engine, daemon=True).start()
-    threading.Thread(target=health_monitor, daemon=True).start()
-    
-    app.run(host='0.0.0.0', port=APP_PORT, debug=False)
+@app.route("/debug/ping", methods=["GET"])
+def ping():
+    return jsonify({"msg": "pong"}), 200
+
+# ---------- Startup ----------
+
+if __name__ == "__main__":
+    try:
+        setup_database()
+        seed_admin_roles()
+        # Do not start background threads here in a single-process WSGI; prefer external schedulers.
+        logger.info("Starting Two Manga API on port %s", APP_PORT)
+        app.run(host="0.0.0.0", port=APP_PORT, debug=False)
+    except Exception:
+        logger.exception("Failed to start application")
+        raise
