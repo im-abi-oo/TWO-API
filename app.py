@@ -1,4 +1,4 @@
-# app.py (FINAL - full, ready to run)
+# app.py (FINAL - fixed for Marshmallow 4 compat + minor hardening)
 import os
 import uuid
 import json
@@ -97,20 +97,22 @@ else:
 CORS(app, resources={r"/*": {"origins": origins}}, supports_credentials=True)
 
 # ---------- Schemas (Validation) ----------
+# Marshmallow 4 passes kwargs (like data_key) to validators.
+# Ensure all validators accept **kwargs to be future-proof.
 
 class RegisterSchema(Schema):
     username = fields.Str(required=True)
     password = fields.Str(required=True, load_only=True)
 
     @validates("username")
-    def check_username(self, value):
+    def check_username(self, value, **kwargs):
         if not value or len(value.strip()) < 3:
             raise ValidationError("username must be at least 3 characters")
         if " " in value:
             raise ValidationError("username must not contain spaces")
 
     @validates("password")
-    def check_password(self, value):
+    def check_password(self, value, **kwargs):
         if not value or len(value) < 6:
             raise ValidationError("password must be at least 6 characters")
 
@@ -124,14 +126,17 @@ class PaymentSubmitSchema(Schema):
     days = fields.Int(required=True)
 
     @validates("days")
-    def check_days(self, value):
+    def check_days(self, value, **kwargs):
         if value is None or value <= 0 or value > 3650:
             raise ValidationError("days must be between 1 and 3650")
 
 # ---------- Helpers ----------
 
+# Security: choose bcrypt rounds (cost). Default 12 (reasonable).
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
+
 def hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
 
 def check_password(plain: str, hashed: str) -> bool:
     try:
@@ -139,11 +144,19 @@ def check_password(plain: str, hashed: str) -> bool:
     except Exception:
         return False
 
+# Mitigate timing attack info-leak on username enumeration by always checking a hash.
+# Precompute a fake hash once (costly but ok at import time) to use when user not found.
+try:
+    FAKE_PASSWORD_HASH = bcrypt.hashpw(b"fake_password_for_timing_mitigation", bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
+except Exception:
+    # fallback: a static known bcrypt hash (safe default)
+    FAKE_PASSWORD_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.2uQf7Pn6y6Gk1v4b6ZJdXb0sZr7Qe6"  # example hash
+
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            verify_jwt_in_request()
+            # assume @jwt_required applied on route (avoid double verify)
             identity = get_jwt_identity()
             if not identity:
                 return jsonify({"msg": "unauthorized"}), 401
@@ -164,7 +177,7 @@ def single_session_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            verify_jwt_in_request()
+            # assume @jwt_required already ensured JWT; just verify session_salt matches DB
             claims = get_jwt()
             identity = get_jwt_identity()
             if not identity:
@@ -280,8 +293,12 @@ def login():
         data = LoginSchema().load(payload)
         username = data["username"].strip().lower()
         password = data["password"]
+        # Mitigate username enumeration timing by always checking a hash
         user = mongo.db.users.find_one({"username": username})
-        if not user or not check_password(password, user["password"]):
+        hash_to_check = user["password"] if user else FAKE_PASSWORD_HASH
+        # perform password check regardless
+        pw_ok = check_password(password, hash_to_check)
+        if not user or not pw_ok:
             return jsonify({"msg": "invalid credentials"}), 401
         salt = str(uuid.uuid4())
         mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"session_salt": salt}})
@@ -298,7 +315,7 @@ def login():
 @jwt_required(refresh=True)
 def refresh():
     try:
-        verify_jwt_in_request()
+        # jwt_required already ensured a valid refresh token
         claims = get_jwt()
         identity = get_jwt_identity()
         if not identity:
@@ -380,7 +397,9 @@ def verify_tx_on_chain(tx_hash: str) -> bool:
                     continue
             return False
 
-        return True
+        # If explorers not configured, do not auto-approve (avoid accepting everything in prod)
+        logger.warning("No EXPLORER_URLS configured; verify_tx_on_chain returns False by default.")
+        return False
     except Exception:
         logger.exception("verify_tx_on_chain error")
         return False
