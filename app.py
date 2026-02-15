@@ -1,4 +1,4 @@
-# app.py
+# app.py (UPDATED - full)
 import os
 import uuid
 import json
@@ -17,9 +17,10 @@ from flask_jwt_extended import (
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from marshmallow import Schema, fields, ValidationError, validates
-from pymongo import ASCENDING, errors as pymongo_errors
+from pymongo import ASCENDING, DESCENDING, errors as pymongo_errors
 from bson.objectid import ObjectId
 import bcrypt
+import requests
 
 # ---------- Configuration & Logging ----------
 
@@ -38,6 +39,19 @@ ADMIN_USERNAMES = [u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").s
 # Optional tuning
 ACCESS_EXPIRES_HOURS = int(os.getenv("ACCESS_EXPIRES_HOURS", "4"))
 REFRESH_EXPIRES_DAYS = int(os.getenv("REFRESH_EXPIRES_DAYS", "30"))
+
+# External rate sources (configurable)
+BRSAPI_KEY = os.getenv("BRSAPI_KEY", "")
+BRSAPI_URL = os.getenv("BRSAPI_URL", f"https://BrsApi.ir/Api/Market/Gold_Currency.php")
+NOBITEX_STATS_URL = os.getenv("NOBITEX_STATS_URL", "https://apiv2.nobitex.ir/market/stats")
+API_LOCAL_RATES = os.getenv("API_LOCAL_RATES", "/public/rates")
+
+# Explorer validation config (comma-separated URLs with {tx_hash} placeholder)
+EXPLORER_URLS = os.getenv("EXPLORER_URLS", "")  # e.g. "https://api.tronscan.org/api/transaction-info?hash={tx_hash},https://api.solscan.io/transaction/{tx_hash}"
+
+# Scheduler options
+ENABLE_RATE_SCHEDULER = os.getenv("ENABLE_RATE_SCHEDULER", "false").lower() == "true"
+RATE_FETCH_MINUTES = int(os.getenv("RATE_FETCH_MINUTES", "60"))
 
 # Logging
 logging.basicConfig(
@@ -170,6 +184,7 @@ def setup_database():
         mongo.db.users.create_index([("username", ASCENDING)], unique=True)
         mongo.db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
         mongo.db.coupons.create_index([("code", ASCENDING)], unique=True)
+        mongo.db.rates.create_index([("ts", DESCENDING)])
         # optional: logs/temporary ttl index example (commented out)
         logger.info("Database indices ensured.")
     except Exception as e:
@@ -318,14 +333,36 @@ def get_status():
 
 def verify_tx_on_chain(tx_hash: str) -> bool:
     """
-    Placeholder for blockchain transaction verification.
-    In production, integrate with the relevant chain explorer or node RPC,
-    check confirmations, network, amounts etc.
-    Minimal sanity check used here.
+    Configurable verification:
+    - If EXPLORER_URLS env var provided (comma-separated urls containing {tx_hash}), try each and treat HTTP 200 as success.
+    - Otherwise fallback to minimal local sanity check (length).
+    This design lets you plug in real explorer endpoints without hard-coding specific providers.
     """
-    if not tx_hash or len(tx_hash) < 8:
+    try:
+        # basic sanity
+        if not tx_hash or len(tx_hash) < 8:
+            return False
+
+        if EXPLORER_URLS:
+            urls = [u.strip() for u in EXPLORER_URLS.split(",") if u.strip()]
+            for template in urls:
+                try:
+                    url = template.replace("{tx_hash}", tx_hash)
+                    r = requests.get(url, timeout=5)
+                    # treat 200 as probable existence; explorers vary in schema, so keep it permissive
+                    if r.status_code == 200:
+                        logger.info("Explorer validated tx via %s", url)
+                        return True
+                except Exception:
+                    continue
+            # if none validated, return False
+            return False
+
+        # no explorers configured -> fallback permissive
+        return True
+    except Exception:
+        logger.exception("verify_tx_on_chain error")
         return False
-    return True
 
 @app.route("/payment/submit", methods=["POST"])
 @jwt_required()
@@ -365,8 +402,9 @@ def submit_payment():
         if mongo.db.transactions.find_one({"tx_hash": tx_hash}):
             return jsonify({"msg": "tx_hash already submitted"}), 400
 
-        if not verify_tx_on_chain(tx_hash):
-            # Keep entry as pending but flag as unverifiable (admin will investigate)
+        # verify on chain if possible (this may call configured explorers)
+        verified = verify_tx_on_chain(tx_hash)
+        if not verified:
             status = "pending_verification"
         else:
             status = "pending"
@@ -514,13 +552,177 @@ def list_coupons():
         logger.exception("list_coupons error")
         return jsonify({"msg": "internal error"}), 500
 
+# ---------- Rates fetching & public endpoint ----------
+
+def fetch_and_store_rates():
+    """
+    Fetch rates from configured external services and store a snapshot in mongo.db.rates.
+    Stored format example:
+    {
+      "ts": datetime,
+      "USDT": 160000,
+      "TRX": 5000,
+      "TON": 45000,
+      "SOL": 2000000
+    }
+    """
+    try:
+        out = {"ts": datetime.datetime.utcnow()}
+        # 1) Try BrsApi (USDT -> Toman)
+        try:
+            brs_url = BRSAPI_URL
+            if BRSAPI_KEY:
+                # if API expects key param
+                if "?" in brs_url:
+                    brs_url = f"{brs_url}&key={BRSAPI_KEY}"
+                else:
+                    brs_url = f"{brs_url}?key={BRSAPI_KEY}"
+            r = requests.get(brs_url, timeout=6)
+            if r.ok:
+                j = r.json()
+                usdt = None
+                if isinstance(j, dict):
+                    if j.get("price") and (j.get("symbol","").upper()=="USDT"):
+                        usdt = float(j.get("price"))
+                    elif j.get("USDT") and isinstance(j["USDT"], dict) and j["USDT"].get("price"):
+                        usdt = float(j["USDT"]["price"])
+                    elif "cryptocurrency" in j and isinstance(j["cryptocurrency"], list):
+                        for it in j["cryptocurrency"]:
+                            if (it.get("symbol","").upper() == "USDT") and it.get("price"):
+                                usdt = float(it.get("price"))
+                                break
+                elif isinstance(j, list):
+                    for it in j:
+                        if (it.get("symbol","").upper() == "USDT") and it.get("price"):
+                            usdt = float(it.get("price"))
+                            break
+                if usdt:
+                    out["USDT"] = int(round(usdt))
+        except Exception:
+            logger.exception("brsapi fetch failed")
+
+        # 2) Nobitex stats: latest in RIAL => convert to Toman
+        try:
+            base = NOBITEX_STATS_URL
+            for code, sym in (("trx","TRX"), ("usdt","USDT"), ("ton","TON"), ("sol","SOL")):
+                try:
+                    resp = requests.get(base, params={"srcCurrency": code, "dstCurrency": "rls"}, timeout=6)
+                    if resp.ok:
+                        jr = resp.json()
+                        stats = jr.get("stats") or {}
+                        key = next((k for k in stats.keys() if k.startswith(code)), None)
+                        if key:
+                            latest_riyal = int(float(stats[key].get("latest", 0)))
+                            out[sym] = latest_riyal // 10
+                except Exception:
+                    continue
+        except Exception:
+            logger.exception("nobitex fetch failed")
+
+        if not any(k in out for k in ("USDT","TRX","TON","SOL")):
+            logger.warning("No external rates fetched; skipping store")
+            return False
+
+        mongo.db.rates.insert_one(out)
+        # keep only recent history (e.g., 7 days)
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+        mongo.db.rates.delete_many({"ts": {"$lt": cutoff}})
+        logger.info("Rates stored: %s", out)
+        return True
+    except Exception:
+        logger.exception("fetch_and_store_rates failed")
+        return False
+
+@app.route("/public/rates", methods=["GET"])
+def public_rates():
+    """
+    Returns latest cached rates. If nothing cached, 404.
+    """
+    try:
+        last = mongo.db.rates.find_one(sort=[("ts", DESCENDING)])
+        if not last:
+            return jsonify({"msg": "no rates available"}), 404
+        last.pop("_id", None)
+        if isinstance(last.get("ts"), datetime.datetime):
+            last["ts"] = last["ts"].isoformat()
+        return jsonify(last), 200
+    except Exception:
+        logger.exception("public_rates error")
+        return jsonify({"msg": "internal error"}), 500
+
+@app.route("/admin/fetch-rates", methods=["POST"])
+@jwt_required()
+@admin_required
+def admin_fetch_rates():
+    try:
+        ok = fetch_and_store_rates()
+        if ok:
+            return jsonify({"msg": "rates fetched"}), 200
+        return jsonify({"msg": "no rates fetched"}), 500
+    except Exception:
+        logger.exception("admin_fetch_rates error")
+        return jsonify({"msg":"internal error"}), 500
+
+# ---------- User transactions endpoint (for frontend) ----------
+
+@app.route("/user/transactions", methods=["GET"])
+@jwt_required()
+@single_session_required
+def user_transactions():
+    """
+    Return transactions for the authenticated user.
+    Query params:
+      - limit (default 50, max 200)
+      - status (optional) to filter by status
+    """
+    try:
+        user = g.current_user
+        try:
+            limit = min(200, int(request.args.get("limit", 50)))
+        except Exception:
+            limit = 50
+        status = request.args.get("status")
+        q = {"user_id": user["_id"]}
+        if status:
+            q["status"] = status
+        cursor = mongo.db.transactions.find(q).sort("created_at", -1).limit(limit)
+        out = []
+        for t in cursor:
+            t["_id"] = str(t["_id"])
+            t["user_id"] = str(t["user_id"])
+            if "processed_at" in t and isinstance(t["processed_at"], datetime.datetime):
+                t["processed_at"] = t["processed_at"].isoformat()
+            if "created_at" in t and isinstance(t["created_at"], datetime.datetime):
+                t["created_at"] = t["created_at"].isoformat()
+            out.append(t)
+        return jsonify({"transactions": out}), 200
+    except Exception:
+        logger.exception("user_transactions error")
+        return jsonify({"msg": "internal error"}), 500
+
+# ---------- Coupons Management (Admin) continued (already above) ----------
+
+# (create_coupon and list_coupons already defined earlier)
+
 # ---------- Utilities ----------
 
 @app.route("/debug/ping", methods=["GET"])
 def ping():
     return jsonify({"msg": "pong"}), 200
 
+# ---------- Optional scheduler setup (APScheduler) ----------
+if ENABLE_RATE_SCHEDULER:
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        sched = BackgroundScheduler()
+        sched.add_job(fetch_and_store_rates, 'interval', minutes=RATE_FETCH_MINUTES, next_run_time=datetime.datetime.utcnow())
+        sched.start()
+        logger.info("Background rate fetch scheduler started every %s minutes", RATE_FETCH_MINUTES)
+    except Exception:
+        logger.exception("Failed to start APScheduler; consider using external cron/job runner")
+
 # ---------- Startup (dev) ----------
+
 if __name__ == "__main__":
     try:
         logger.info("Starting Two Manga API on port %s", APP_PORT)
