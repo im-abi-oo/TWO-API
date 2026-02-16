@@ -1,14 +1,10 @@
-# two_manga_api_final_queue.py
-"""
-Two Manga API - final production-ready single-file version with in-process priority queue.
-Features:
- - No global rate limiting.
- - In-memory prioritized request queue (no Redis) with worker threads.
- - /me (auth/me) is high priority and will wait a short time for processing result.
- - Admin auth: JWT as before OR Basic Auth using ADMIN_USERNAME / ADMIN_PASSWORD env.
- - DBManager robust connection + monitor thread.
- - All env notes are below.
-"""
+# two_manga_api.py
+# Two Manga API — queue mode (threaded workers)
+# تغییرات اعمال شده:
+#  - حذف خودکارسازی تایید تراکنش: همه تراکنش‌ها فقط "pending" می‌شوند و نیاز به تایید دستی ادمین دارند.
+#  - بهبود چک ادمین (ENV admin + usernames).
+#  - هیچ وابستگی به redis یا rate-limiter وجود ندارد.
+#  - بقیهٔ منطق همان است و آماده اجراست (تنظیم متغیرهای محیطی لازم است).
 
 import os
 import uuid
@@ -37,28 +33,6 @@ from bson.objectid import ObjectId
 import bcrypt
 import requests
 from pymongo import MongoClient
-
-# -------------------------
-# ENVIRONMENT / CONFIG NOTES
-# -------------------------
-# Required:
-#   MONGO_URI          - MongoDB connection URI
-#   JWT_SECRET_KEY     - long random secret for JWT
-#
-# Optional / recommended:
-#   MONGO_DBNAME (default "twomanga")
-#   PORT (default 5001)
-#   ADMIN_USERNAMES    - comma-separated usernames to mark existing users as admin
-#   ADMIN_USERNAME     - single admin username to create/update at startup
-#   ADMIN_PASSWORD     - password for ADMIN_USERNAME (store securely in env)
-#   EXPLORER_URLS      - comma-separated templates with {tx_hash} for auto verification (leave empty for manual)
-#   WORKER_COUNT       - number of queue worker threads (default 4)
-#   JOB_WAIT_SECONDS   - secs endpoints wait for job result before returning queued (default 5)
-#   DB_PING_INTERVAL, DB_CONNECT_RETRIES, DB_CONNECT_TIMEOUT_MS - DB tuning
-#
-# Security note:
-#   - ADMIN_USERNAME/ADMIN_PASSWORD must be set as secrets on hosting platform.
-#   - Always use HTTPS when using Basic Auth.
 
 # ---------- Configuration & Logging ----------
 
@@ -305,6 +279,7 @@ def seed_admin_roles_safe():
             return
         for u in ADMIN_USERNAMES:
             try:
+                # apply role=admin to existing users matching the env list (lowercased)
                 users.update_one({"username": u}, {"$set": {"role": "admin"}}, upsert=False)
             except Exception:
                 logger.exception("Failed applying admin role for %s", u)
@@ -412,13 +387,17 @@ def admin_required(fn):
                 identity = get_jwt_identity()
             except Exception:
                 identity = None
+            # 1) If JWT identity exists, check DB role or usernames from ENV
             if identity:
+                identity_l = identity.strip().lower()
                 users = db_manager.get_collection("users")
-                user = users.find_one({"username": identity})
-                if user and (user.get("role") == "admin" or identity.lower() in ADMIN_USERNAMES):
+                user = users.find_one({"username": identity_l})
+                # role check OR explicit username list match OR match env-admin username
+                if user and (user.get("role") == "admin" or identity_l in ADMIN_USERNAMES or (ADMIN_ENV_USERNAME and identity_l == ADMIN_ENV_USERNAME.strip().lower())):
                     g.current_user = user
                     return fn(*args, **kwargs)
                 return jsonify({"msg": "admin required"}), 403
+            # 2) Basic auth fallback to env-admin
             if _is_request_basic_admin():
                 g.current_user = {"username": ADMIN_ENV_USERNAME.strip().lower(), "role": "admin", "_env_admin": True}
                 return fn(*args, **kwargs)
@@ -439,12 +418,13 @@ def single_session_required(fn):
             if not identity:
                 return jsonify({"msg": "unauthorized"}), 401
             users = db_manager.get_collection("users")
-            user = users.find_one({"username": identity}, {"session_salt": 1})
+            # fetch session_salt for identity (lowercased)
+            user = users.find_one({"username": identity.strip().lower()}, {"session_salt": 1})
             if not user:
                 return jsonify({"msg": "user not found"}), 401
             if claims.get("session_salt") != user.get("session_salt"):
                 return jsonify({"msg": "session invalidated"}), 401
-            g.current_user = users.find_one({"username": identity})
+            g.current_user = users.find_one({"username": identity.strip().lower()})
             return fn(*args, **kwargs)
         except DatabaseUnavailable:
             return jsonify({"msg": "database unavailable"}), 503
@@ -588,12 +568,14 @@ def register():
             return jsonify({"msg": "username already exists"}), 409
         hashed = hash_password(password)
         now = datetime.datetime.utcnow()
+        # If username is in ADMIN_USERNAMES or matches ADMIN_ENV_USERNAME, grant admin role
+        is_admin_role = (username in ADMIN_USERNAMES) or (ADMIN_ENV_USERNAME and username == ADMIN_ENV_USERNAME.strip().lower())
         user_doc = {
             "username": username,
             "password": hashed,
             "created_at": now,
             "session_salt": str(uuid.uuid4()),
-            "role": "admin" if username in ADMIN_USERNAMES else "user",
+            "role": "admin" if is_admin_role else "user",
             "expiryDate": None,
             "total_purchases": 0
         }
@@ -644,7 +626,7 @@ def refresh():
         identity = get_jwt_identity()
         if not identity:
             return jsonify({"msg": "unauthorized"}), 401
-        user = users.find_one({"username": identity}, {"session_salt": 1})
+        user = users.find_one({"username": identity.strip().lower()}, {"session_salt": 1})
         if not user:
             return jsonify({"msg": "user not found"}), 404
         if claims.get("session_salt") != user.get("session_salt"):
@@ -684,8 +666,6 @@ def _process_me(username: str):
 def auth_me():
     # this endpoint has highest priority: priority 0
     identity = get_jwt_identity()
-    # enqueue job and WAIT for short time (JOB_WAIT_SECONDS). If worker processes quickly, returns real result.
-    # If worker is busy and timeout occurs, return queued status to client.
     try:
         result = enqueue_job(func=_process_me, args=(identity,), priority=0, wait=True, wait_timeout=JOB_WAIT_SECONDS)
         if result.get("finished"):
@@ -700,6 +680,12 @@ def auth_me():
 
 # ---------- Payment & coupons (enqueue medium priority) ----------
 def verify_tx_on_chain(tx_hash: str) -> bool:
+    """
+    NOTE: This function NO LONGER causes automatic approval.
+    It will attempt to fetch explorers (if configured) and only log findings.
+    Regardless, submission flow will create a transaction with status 'pending'
+    and require manual admin approval.
+    """
     try:
         if not tx_hash or len(tx_hash) < 8:
             return False
@@ -710,12 +696,11 @@ def verify_tx_on_chain(tx_hash: str) -> bool:
                     url = template.replace("{tx_hash}", tx_hash)
                     r = requests.get(url, timeout=5)
                     if r.status_code == 200:
-                        logger.info("Explorer validated tx via %s", url)
+                        logger.info("Explorer returned 200 for tx via %s", url)
+                        # We log but do NOT auto-approve.
                         return True
                 except Exception:
                     continue
-            return False
-        logger.warning("No EXPLORER_URLS configured; verify_tx_on_chain returns False by default (manual admin approval required).")
         return False
     except Exception:
         logger.exception("verify_tx_on_chain error")
@@ -751,14 +736,17 @@ def _process_submit_payment(user_obj, payload):
         return {"msg": "tx_hash or coupon required"}, 400
     if transactions.find_one({"tx_hash": tx_hash}):
         return {"msg": "tx_hash already submitted"}, 400
-    verified = verify_tx_on_chain(tx_hash)
-    status = "pending" if verified else "pending_verification"
+
+    # IMPORTANT: always set to 'pending' and require manual admin approval.
+    # We may still attempt to query explorers (for logging) but do not change status.
+    _ = verify_tx_on_chain(tx_hash)  # result used only for logging
+
     tx_doc = {
         "user_id": user["_id"],
         "username": user["username"],
         "tx_hash": tx_hash,
         "days": days,
-        "status": status,
+        "status": "pending",
         "created_at": datetime.datetime.utcnow()
     }
     try:
@@ -766,7 +754,7 @@ def _process_submit_payment(user_obj, payload):
     except pymongo_errors.DuplicateKeyError:
         return {"msg": "tx_hash already exists"}, 400
     tx_id = str(inserted.inserted_id)
-    return {"msg": "payment submitted", "tx_id": tx_id, "status": status}, 200
+    return {"msg": "payment submitted", "tx_id": tx_id, "status": "pending"}, 200
 
 @app.route("/payment/submit", methods=["POST"])
 @jwt_required()
@@ -776,8 +764,7 @@ def submit_payment():
         payload = request.get_json(force=True)
         data = PaymentSubmitSchema().load(payload)
         # For payments, enqueue with medium priority (10)
-        # We will not block waiting for result — return queued immediate response
-        # but to be convenient return tx placeholder if job completes quickly (wait short)
+        # We will try to wait a short time to return immediate result if possible.
         user = g.current_user
         result = enqueue_job(func=_process_submit_payment, args=(user, data), priority=10, wait=True, wait_timeout=1.0)
         if result.get("finished"):
@@ -804,7 +791,7 @@ def admin_approve_transaction(tx_id):
         oid = to_objectid(tx_id)
         if not oid:
             return jsonify({"msg": "invalid tx id"}), 400
-        tx = transactions.find_one({"_id": oid, "status": {"$in": ["pending", "pending_verification"]}})
+        tx = transactions.find_one({"_id": oid, "status": {"$in": ["pending"]}})
         if not tx:
             return jsonify({"msg": "transaction not found or already processed"}), 404
         user = users.find_one({"_id": tx["user_id"]})
@@ -832,7 +819,7 @@ def admin_reject_transaction(tx_id):
         oid = to_objectid(tx_id)
         if not oid:
             return jsonify({"msg": "invalid tx id"}), 400
-        tx = transactions.find_one({"_id": oid, "status": {"$in": ["pending", "pending_verification"]}})
+        tx = transactions.find_one({"_id": oid, "status": {"$in": ["pending"]}})
         if not tx:
             return jsonify({"msg": "transaction not found or already processed"}), 404
         rejected_by = g.current_user.get("username") if g.current_user else "unknown"
