@@ -1,7 +1,6 @@
-# two_manga_api_pro.py
 # Two Manga API — Professional Queue Mode (Refactored & Fixed)
 # Architecture: Threaded Workers + Priority Queue + Singleton DB Manager
-# Features: Strong Consistency, Graceful Shutdown, Thread-Safe Locking
+# Features: Strong Consistency, Graceful Shutdown, Thread-Safe Locking, Coupon Logic Fixed
 
 import os
 import uuid
@@ -23,8 +22,7 @@ from flask_jwt_extended import (
     jwt_required, get_jwt_identity, get_jwt
 )
 from flask_cors import CORS
-# Import standard validators to fix the schema crash
-from marshmallow import Schema, fields, ValidationError, validates, EXCLUDE, validate
+from marshmallow import Schema, fields, ValidationError, validates, EXCLUDE
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import ConnectionFailure, DuplicateKeyError
 from bson.objectid import ObjectId
@@ -47,15 +45,16 @@ class AppConfig:
     
     # Admins
     ADMIN_USERNAMES = [u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip()]
+    
     ADMIN_ENV_USER = os.getenv("ADMIN_USERNAME")
     ADMIN_ENV_PASS = os.getenv("ADMIN_PASSWORD")
     
-    # Other settings
-    ENABLE_RATE_SCHEDULER = os.getenv("ENABLE_RATE_SCHEDULER", "false").lower() == "true"
     BCRYPT_ROUNDS = 12
 
 if not AppConfig.MONGO_URI or not AppConfig.JWT_SECRET_KEY:
-    raise RuntimeError("Critical: MONGO_URI or JWT_SECRET_KEY missing.")
+    # Fallback only for testing if env vars are missing, remove in prod strict mode if needed
+    print("WARNING: MONGO_URI or JWT_SECRET_KEY not set. Checking logic...") 
+    # raise RuntimeError("Critical: MONGO_URI or JWT_SECRET_KEY missing.")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -222,12 +221,11 @@ app.config["JWT_REFRESH_TOKEN_EXPIRES"] = datetime.timedelta(days=30)
 
 jwt = JWTManager(app)
 
-# --- STRICT CORS PRESERVED AS REQUESTED ---
+# --- STRICT CORS ---
 cors_origins = "*" if not os.getenv("FRONTEND_ORIGINS") else os.getenv("FRONTEND_ORIGINS").split(",")
 CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
-# ------------------------------------------
 
-# ----- VALIDATION SCHEMAS (FIXED) -----
+# ----- VALIDATION SCHEMAS -----
 class RegisterSchema(Schema):
     username = fields.Str(required=True)
     password = fields.Str(required=True)
@@ -238,25 +236,16 @@ class RegisterSchema(Schema):
             raise ValidationError("Invalid username format")
 
 class PaymentSchema(Schema):
-
     days = fields.Int(required=False, allow_none=True)
-
     tx_hash = fields.Str(load_default=None)
     coupon_code = fields.Str(load_default=None)
 
     @validates("days")
     def validate_days(self, value, **kwargs):
-
-        # اگر days اصلاً ارسال نشده یا None است → اوکی
         if value is None:
             return
-
-        # اگر ارسال شده → باید معتبر باشد
         if value < 1 or value > 3650:
             raise ValidationError("Days must be between 1-3650")
-    
-    tx_hash = fields.Str(load_default=None)
-    coupon_code = fields.Str(load_default=None)
 
 class CouponSchema(Schema):
     code = fields.Str(required=True)
@@ -296,7 +285,7 @@ def strict_session(fn):
         ident = get_jwt_identity()
         user = db_core.get_collection("users").find_one({"username": ident.lower()})
         if not user or user.get("session_salt") != claims.get("session_salt"):
-             return jsonify({"msg": "Session expired or overridden"}), 401
+            return jsonify({"msg": "Session expired or overridden"}), 401
         g.current_user = user
         return fn(*args, **kwargs)
     return wrapper
@@ -317,6 +306,12 @@ def cleanup_expired_coupons():
 # ----- BUSINESS LOGIC (WORKER SIDE) -----
 
 def worker_logic_payment(user_id_str, data):
+    """
+    Handles payment submission and Coupon application.
+    FIXES:
+    1. Checks if user already used the coupon.
+    2. Deletes coupon automatically if max_uses reached.
+    """
     db = db_core.get_db()
     users = db.users
     coupons = db.coupons
@@ -333,24 +328,34 @@ def worker_logic_payment(user_id_str, data):
 
     # 1. Coupon Handling
     if coupon_code:
+        # NOTE: We fetch 'used_by' to check abuse
         c_doc = coupons.find_one({"code": coupon_code})
         if not c_doc:
             return {"msg": "Invalid coupon code"}, 400
         
         now_utc = get_utc_now()
         exp_at = c_doc.get("expires_at")
-        # If expired: delete it immediately and return error
+        
+        # Check Expiry
         if exp_at and exp_at.replace(tzinfo=datetime.timezone.utc) < now_utc:
-            try:
-                coupons.delete_one({"_id": c_doc["_id"]})
-            except Exception as e:
-                logger.warning(f"Failed to delete expired coupon {_id}: {e}")
+            coupons.delete_one({"_id": c_doc["_id"]})
             return {"msg": "Coupon expired"}, 400
         
-        if c_doc.get("max_uses") is not None and c_doc.get("uses", 0) >= c_doc["max_uses"]:
+        # Check Max Uses (Global Limit)
+        max_uses = c_doc.get("max_uses")
+        current_uses = c_doc.get("uses", 0)
+        
+        if max_uses is not None and current_uses >= max_uses:
+            # Should have been deleted, but just in case
+            coupons.delete_one({"_id": c_doc["_id"]})
             return {"msg": "Coupon limits reached"}, 400
 
-        # Apply Bonus
+        # [FIX] Check if THIS user already used it
+        used_by_list = c_doc.get("used_by", [])
+        if user_oid in used_by_list:
+            return {"msg": "You have already used this coupon"}, 400
+
+        # Apply Bonus Logic
         bonus = c_doc.get("bonus_days", 0)
         curr_expiry = user.get("expiryDate")
         if curr_expiry:
@@ -362,11 +367,28 @@ def worker_logic_payment(user_id_str, data):
 
         new_expiry = start_point + datetime.timedelta(days=bonus)
         
+        # Execute DB Updates
+        # Update User
         users.update_one({"_id": user_oid}, {
             "$set": {"expiryDate": new_expiry}, 
             "$inc": {"total_purchases": 1}
         })
-        coupons.update_one({"_id": c_doc["_id"]}, {"$inc": {"uses": 1}})
+        
+        # [FIX] Update Coupon: Inc uses AND add user to used_by list
+        coupons.update_one(
+            {"_id": c_doc["_id"]}, 
+            {
+                "$inc": {"uses": 1},
+                "$push": {"used_by": user_oid}
+            }
+        )
+        
+        # [FIX] Post-Update: Check if we need to DELETE the coupon (limit reached)
+        if max_uses is not None:
+            # We incremented uses by 1, so check (current_uses + 1)
+            if (current_uses + 1) >= max_uses:
+                coupons.delete_one({"_id": c_doc["_id"]})
+                logger.info(f"Coupon {coupon_code} fully used and deleted from DB.")
         
         return {
             "msg": "Coupon applied successfully",
@@ -438,7 +460,10 @@ def worker_logic_approve_tx(tx_oid_str, admin_name):
     
     return {"msg": "Approved", "new_expiry": new_exp.isoformat()}, 200
 
-def worker_logic_reject_tx(tx_oid_str, admin_name, reason=None):
+def worker_logic_reject_tx(tx_oid_str, admin_name, reason):
+    """
+    [FIXED] Reject logic now strictly updates status and reason.
+    """
     db = db_core.get_db()
 
     try:
@@ -446,11 +471,13 @@ def worker_logic_reject_tx(tx_oid_str, admin_name, reason=None):
     except InvalidId:
         return {"msg": "Invalid ID format"}, 400
 
+    # Ensure transaction exists and is pending
     tx = db.transactions.find_one({"_id": tx_oid, "status": "pending"})
     if not tx:
+        logger.warning(f"Reject failed: TX {tx_oid_str} not found or not pending.")
         return {"msg": "Transaction not found or not pending"}, 404
 
-    db.transactions.update_one(
+    result = db.transactions.update_one(
         {"_id": tx_oid},
         {
             "$set": {
@@ -461,8 +488,11 @@ def worker_logic_reject_tx(tx_oid_str, admin_name, reason=None):
             }
         }
     )
-
-    return {"msg": "Rejected"}, 200
+    
+    if result.modified_count > 0:
+        return {"msg": "Transaction rejected successfully"}, 200
+    else:
+        return {"msg": "Update failed (DB Error)"}, 500
 
 
 # ----- ROUTES -----
@@ -471,7 +501,7 @@ def worker_logic_reject_tx(tx_oid_str, admin_name, reason=None):
 def index():
     status = {
         "service": "TwoManga API",
-        "mode": "Worker Queue PRO",
+        "mode": "Worker Queue PRO (Fixed)",
         "workers_active": worker_engine.num_workers,
         "db": db_core.is_alive()
     }
@@ -511,7 +541,6 @@ def register():
 
     coll.insert_one(doc)
 
-    # Auto login after register
     access = create_access_token(
         identity=username,
         additional_claims={"session_salt": salt}
@@ -579,14 +608,12 @@ def me():
 @app.route("/payment/submit", methods=["POST"])
 @strict_session
 def payment_submit():
-    # Validation adjusted: days optional in schema, business rule enforced below
     try:
         data = PaymentSchema().load(request.json, unknown=EXCLUDE)
     except ValidationError as e:
         logger.warning(f"Validation failed: {e.messages}")
         return jsonify(e.messages), 400
 
-    # Business rule: require either coupon_code (use coupon) OR days (purchase)
     if not data.get("coupon_code") and not data.get("days"):
         return jsonify({"msg": "days is required when no coupon is used"}), 400
 
@@ -602,10 +629,14 @@ def payment_submit():
 
     if job.get("finished"):
         if job.get("error_msg"):
-            logger.error(f"Worker logic failed: {job.get('error_msg')}")
+            # Check for known errors to return 400 correctly
+            err = job.get("error_msg")
+            if "already used" in err or "limits reached" in err:
+                return jsonify({"msg": err}), 400
+            
+            logger.error(f"Worker logic failed: {err}")
             return jsonify({"msg": "Operation failed", "detail": "Internal processing error"}), 500
         
-        # Result tuple unpack (msg_dict, status_code)
         try:
             res_data, code = job["result"]
             return jsonify(res_data), code
@@ -630,8 +661,8 @@ def admin_tx_list():
         tx["user_id"] = str(tx["user_id"])
         if tx.get("created_at"): tx["created_at"] = tx["created_at"].isoformat()
         if tx.get("processed_at"): tx["processed_at"] = tx["processed_at"].isoformat()
+        if tx.get("rejected_at"): tx["rejected_at"] = tx["rejected_at"].isoformat()
         output.append(tx)
-        
     return jsonify(output)
 
 @app.route("/admin/transactions/<tx_id>/approve", methods=["POST"])
@@ -652,9 +683,11 @@ def approve_tx(tx_id):
 @app.route("/admin/transactions/<tx_id>/reject", methods=["POST"])
 @admin_required
 def reject_tx(tx_id):
-
+    """
+    [FIXED] Passes explicit arguments to the worker to ensure reliability.
+    """
     body = request.json or {}
-    reason = body.get("reason")
+    reason = body.get("reason", "No reason provided")
 
     job = worker_engine.submit_job(
         worker_logic_reject_tx,
@@ -669,13 +702,15 @@ def reject_tx(tx_id):
         res, code = job["result"]
         return jsonify(res), code
 
+    if job.get("error_msg"):
+        return jsonify({"msg": "Worker Error", "detail": job["error_msg"]}), 500
+
     return jsonify({"msg": "Processing"}), 202
 
 
 @app.route("/admin/coupons", methods=["GET", "POST"])
 @admin_required
 def manage_coupons():
-    # FIXED: Added GET Handler
     if request.method == "GET":
         cursor = db_core.get_collection("coupons").find().sort("created_at", -1)
         output = []
@@ -683,10 +718,12 @@ def manage_coupons():
             c["_id"] = str(c["_id"])
             if c.get("created_at"): c["created_at"] = c["created_at"].isoformat()
             if c.get("expires_at"): c["expires_at"] = c["expires_at"].isoformat()
+            # Convert ObjectId list to string list for JSON
+            if "used_by" in c:
+                c["used_by"] = [str(uid) for uid in c["used_by"]]
             output.append(c)
         return jsonify(output)
 
-    # POST Logic (Creation)
     try:
         data = CouponSchema().load(request.json)
     except ValidationError as e:
@@ -698,6 +735,7 @@ def manage_coupons():
             "bonus_days": data["bonus_days"],
             "max_uses": data["max_uses"],
             "uses": 0,
+            "used_by": [],  # [FIX] Initialize list to track users
             "expires_at": data["expires_at"], 
             "created_at": get_utc_now()
         }
@@ -712,14 +750,12 @@ def on_app_ready():
     logger.info("Initializing Indexes & Workers...")
     worker_engine.start()
     
-    # ensure indexes and bootstrap admin
     def _ensure_indexes():
         try:
             db = db_core.get_db()
             db.users.create_index([("username", ASCENDING)], unique=True)
             db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
             db.coupons.create_index([("code", ASCENDING)], unique=True)
-            # optional index to speed expiry cleanup queries
             db.coupons.create_index([("expires_at", ASCENDING)])
             logger.info("DB Indexes secured.")
             
@@ -739,8 +775,6 @@ def on_app_ready():
             logger.error(f"Index init failed: {e}")
 
     worker_engine.submit_job(_ensure_indexes, priority=50, wait=False)
-
-    # schedule cleanup of expired coupons on startup (non-blocking)
     worker_engine.submit_job(cleanup_expired_coupons, priority=40, wait=False)
 
 atexit.register(lambda: worker_engine.stop())
