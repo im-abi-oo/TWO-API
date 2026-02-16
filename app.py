@@ -238,12 +238,22 @@ class RegisterSchema(Schema):
             raise ValidationError("Invalid username format")
 
 class PaymentSchema(Schema):
-    # days is now optional; business rule enforced in route
-    days = fields.Int(
-        required=False,
-        allow_none=True,
-        validate=validate.Range(min=1, max=3650, error="Days must be between 1-3650")
-    )
+
+    days = fields.Int(required=False, allow_none=True)
+
+    tx_hash = fields.Str(load_default=None)
+    coupon_code = fields.Str(load_default=None)
+
+    @validates("days")
+    def validate_days(self, value, **kwargs):
+
+        # اگر days اصلاً ارسال نشده یا None است → اوکی
+        if value is None:
+            return
+
+        # اگر ارسال شده → باید معتبر باشد
+        if value < 1 or value > 3650:
+            raise ValidationError("Days must be between 1-3650")
     
     tx_hash = fields.Str(load_default=None)
     coupon_code = fields.Str(load_default=None)
