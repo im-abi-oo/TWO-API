@@ -23,7 +23,7 @@ from flask_jwt_extended import (
 )
 from flask_cors import CORS
 from marshmallow import Schema, fields, ValidationError, validates, EXCLUDE
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, ReturnDocument
 from pymongo.errors import ConnectionFailure, DuplicateKeyError
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
@@ -310,7 +310,8 @@ def worker_logic_payment(user_id_str, data):
     Handles payment submission and Coupon application.
     FIXES:
     1. Checks if user already used the coupon.
-    2. Deletes coupon automatically if max_uses reached.
+    2. Uses atomic compare-and-swap style update for coupon to avoid race conditions.
+    3. Rolls back coupon if applying to user fails.
     """
     db = db_core.get_db()
     users = db.users
@@ -326,70 +327,104 @@ def worker_logic_payment(user_id_str, data):
     days = data.get("days")
     tx_hash = data.get("tx_hash")
 
-    # 1. Coupon Handling
+    # 1. Coupon Handling (IMPROVED: atomic update + rollback)
     if coupon_code:
-        # NOTE: We fetch 'used_by' to check abuse
+        # Fetch coupon document (we need some fields for checks)
         c_doc = coupons.find_one({"code": coupon_code})
         if not c_doc:
             return {"msg": "Invalid coupon code"}, 400
-        
+
         now_utc = get_utc_now()
         exp_at = c_doc.get("expires_at")
-        
-        # Check Expiry
-        if exp_at and exp_at.replace(tzinfo=datetime.timezone.utc) < now_utc:
-            coupons.delete_one({"_id": c_doc["_id"]})
+
+        # Check expiry (and delete expired for cleanliness)
+        if exp_at and (exp_at.replace(tzinfo=datetime.timezone.utc) < now_utc):
+            try:
+                coupons.delete_one({"_id": c_doc["_id"]})
+            except Exception:
+                logger.warning("Failed to delete expired coupon (non-fatal).")
             return {"msg": "Coupon expired"}, 400
-        
-        # Check Max Uses (Global Limit)
+
         max_uses = c_doc.get("max_uses")
         current_uses = c_doc.get("uses", 0)
-        
+
+        # If already at or beyond max, remove and error
         if max_uses is not None and current_uses >= max_uses:
-            # Should have been deleted, but just in case
-            coupons.delete_one({"_id": c_doc["_id"]})
+            try:
+                coupons.delete_one({"_id": c_doc["_id"]})
+            except Exception:
+                logger.warning("Failed to delete exhausted coupon (non-fatal).")
             return {"msg": "Coupon limits reached"}, 400
 
-        # [FIX] Check if THIS user already used it
+        # Check if this user already used it
         used_by_list = c_doc.get("used_by", [])
         if user_oid in used_by_list:
             return {"msg": "You have already used this coupon"}, 400
 
-        # Apply Bonus Logic
-        bonus = c_doc.get("bonus_days", 0)
+        # --- Atomic step: increment uses and push user only if uses == current_uses and user not in used_by ---
+        filter_q = {
+            "_id": c_doc["_id"],
+            "uses": current_uses,
+            "used_by": {"$ne": user_oid}
+        }
+        update_q = {
+            "$inc": {"uses": 1},
+            "$push": {"used_by": user_oid}
+        }
+
+        updated_coupon = coupons.find_one_and_update(
+            filter_q,
+            update_q,
+            return_document=ReturnDocument.AFTER
+        )
+
+        if not updated_coupon:
+            # Another worker modified it or conditions no longer hold
+            return {"msg": "Coupon invalid, expired, already used, or limit reached"}, 400
+
+        # Apply bonus to user — if user update fails, rollback coupon change
+        bonus = updated_coupon.get("bonus_days", 0)
+
         curr_expiry = user.get("expiryDate")
         if curr_expiry:
-            if curr_expiry.tzinfo is None:
-                curr_expiry = curr_expiry.replace(tzinfo=datetime.timezone.utc)
-            start_point = curr_expiry if curr_expiry > now_utc else now_utc
-        else:
-            start_point = now_utc
+            if isinstance(curr_expiry, datetime.datetime):
+                if curr_expiry.tzinfo is None:
+                    curr_expiry = curr_expiry.replace(tzinfo=datetime.timezone.utc)
+            else:
+                curr_expiry = None
 
+        start_point = curr_expiry if (curr_expiry and curr_expiry > now_utc) else now_utc
         new_expiry = start_point + datetime.timedelta(days=bonus)
-        
-        # Execute DB Updates
-        # Update User
-        users.update_one({"_id": user_oid}, {
-            "$set": {"expiryDate": new_expiry}, 
-            "$inc": {"total_purchases": 1}
-        })
-        
-        # [FIX] Update Coupon: Inc uses AND add user to used_by list
-        coupons.update_one(
-            {"_id": c_doc["_id"]}, 
-            {
-                "$inc": {"uses": 1},
-                "$push": {"used_by": user_oid}
-            }
-        )
-        
-        # [FIX] Post-Update: Check if we need to DELETE the coupon (limit reached)
-        if max_uses is not None:
-            # We incremented uses by 1, so check (current_uses + 1)
-            if (current_uses + 1) >= max_uses:
-                coupons.delete_one({"_id": c_doc["_id"]})
-                logger.info(f"Coupon {coupon_code} fully used and deleted from DB.")
-        
+
+        try:
+            users.find_one_and_update(
+                {"_id": user_oid},
+                {
+                    "$set": {"expiryDate": new_expiry},
+                    "$inc": {"total_purchases": 1}
+                }
+            )
+        except Exception as e:
+            # rollback coupon increment if user update fails
+            try:
+                coupons.update_one(
+                    {"_id": updated_coupon["_id"]},
+                    {"$inc": {"uses": -1}, "$pull": {"used_by": user_oid}}
+                )
+            except Exception as rb_e:
+                logger.error(f"[ROLLBACK FAILED] coupon {updated_coupon.get('_id')} rollback failed: {rb_e}")
+            logger.error(f"Failed to apply coupon to user {user_oid}: {e}")
+            return {"msg": "Failed to apply coupon, please retry"}, 500
+
+        # If coupon reached its max_uses after our increment, optionally delete it
+        if updated_coupon.get("max_uses") is not None:
+            try:
+                if updated_coupon["uses"] >= updated_coupon["max_uses"]:
+                    coupons.delete_one({"_id": updated_coupon["_id"]})
+                    logger.info(f"Coupon {coupon_code} fully used and deleted from DB.")
+            except Exception as e:
+                logger.warning(f"Failed to auto-delete exhausted coupon {coupon_code}: {e}")
+
         return {
             "msg": "Coupon applied successfully",
             "new_expiry": new_expiry.isoformat()
