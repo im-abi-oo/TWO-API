@@ -452,47 +452,50 @@ def register():
         data = RegisterSchema().load(request.json)
     except ValidationError as err:
         return jsonify(err.messages), 400
-    
+
     coll = db_core.get_collection("users")
     username = data["username"].strip().lower()
-    
+
     if coll.find_one({"username": username}):
         return jsonify({"msg": "Username exists"}), 409
-        
+
     hashed = hash_password(data["password"])
-    
+
     role = "user"
-    if username in AppConfig.ADMIN_USERNAMES: role = "admin"
-    if AppConfig.ADMIN_ENV_USER and username == AppConfig.ADMIN_ENV_USER.lower(): role = "admin"
+    if username in AppConfig.ADMIN_USERNAMES:
+        role = "admin"
+    if AppConfig.ADMIN_ENV_USER and username == AppConfig.ADMIN_ENV_USER.lower():
+        role = "admin"
+
+    salt = str(uuid.uuid4())
 
     doc = {
         "username": username,
         "password": hashed,
         "role": role,
-        "session_salt": str(uuid.uuid4()),
+        "session_salt": salt,
         "created_at": get_utc_now(),
         "total_purchases": 0
     }
+
     coll.insert_one(doc)
 
-# Auto login after register
-salt = doc["session_salt"]
+    # Auto login after register
+    access = create_access_token(
+        identity=username,
+        additional_claims={"session_salt": salt}
+    )
 
-access = create_access_token(
-    identity=username,
-    additional_claims={"session_salt": salt}
-)
+    refresh = create_refresh_token(
+        identity=username,
+        additional_claims={"session_salt": salt}
+    )
 
-refresh = create_refresh_token(
-    identity=username,
-    additional_claims={"session_salt": salt}
-)
-
-return jsonify({
-    "msg": "Registered",
-    "access_token": access,
-    "refresh_token": refresh
-}), 201
+    return jsonify({
+        "msg": "Registered",
+        "access_token": access,
+        "refresh_token": refresh
+    }), 201
 
 
 @app.route("/auth/login", methods=["POST"])
