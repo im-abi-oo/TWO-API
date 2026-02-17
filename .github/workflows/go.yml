@@ -1,0 +1,97 @@
+name: Go Dependency Sync and Module Tidy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.go'  # Only track changes in .go files
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Allows GitHub Actions to push changes to the repository
+
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          
+      - name: Install dependencies
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init ${GITHUB_REPOSITORY}  # Automatically initialize go.mod with the repository name
+          fi
+          go get ./...  # Install missing dependencies
+          go mod tidy  # Remove unused dependencies and clean up the module
+
+      - name: Check for module file changes
+        id: git_status
+        run: |
+          if [[ $(git status --porcelain go.mod go.sum) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and Push module updates
+        if: steps.git_status.outputs.has_changes == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          git add go.mod go.sum
+          git commit -m "chore: Go module files updated by GitHub Actions [skip ci]"
+          
+          git push
+
+  test:
+    runs-on: ubuntu-latest
+    needs: tidy
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Run tests
+        run: |
+          go test -v ./...  # Run the tests to ensure the code is working correctly
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build the Go application
+        run: |
+          go build -o myapp ./app.go  # Build the app.go file in the root of the project
+
+      - name: Deploy the application
+        run: |
+          # Add deployment commands here, such as copying the binary to a server or container
+          echo "Deploying the application..."
+          # Example: scp myapp user@server:/path/to/deploy
