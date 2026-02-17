@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - '**/*.go'  # فقط زمانی که فایل‌های Go تغییر کنند، ورکفلو اجرا شود
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:  # Allow for manual triggering
 
 permissions:
   contents: write  # Allows GitHub Actions to push changes to the repository
@@ -45,10 +45,9 @@ jobs:
         run: |
           go test -v ./...  # Run the tests to ensure everything works correctly
 
-      # Optional: Upload the test results as an artifact (for debugging if needed)
-      - name: Upload test results (optional)
-        uses: actions/upload-artifact@v3
+      # Step 6: Upload the built binary artifact
+      - name: Upload built binary
+        uses: actions/upload-artifact@v3.1.0  # Use the correct version of upload-artifact
         with:
-          name: test-results
-          path: ./test-results  # If you save the results in a file, use this path
-
+          name: myapp-binary
+          path: myapp  # Upload the built binary
