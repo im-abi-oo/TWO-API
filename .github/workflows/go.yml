@@ -1,97 +1,54 @@
-name: Go Dependency Sync and Module Tidy
+name: Build, Test, and Sync Go Module
 
 on:
   push:
     branches:
       - main
     paths:
-      - '**/*.go'  # Only track changes in .go files
+      - '**/*.go'  # فقط زمانی که فایل‌های Go تغییر کنند، ورکفلو اجرا شود
   workflow_dispatch:  # Allow manual trigger
 
 permissions:
   contents: write  # Allows GitHub Actions to push changes to the repository
 
 jobs:
-  tidy:
+  build_and_test:
     runs-on: ubuntu-latest
-    
+
     steps:
+      # Step 1: Checkout the code
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Setup Go 1.24
+
+      # Step 2: Set up Go environment (specify the version, here we use 1.24)
+      - name: Set up Go 1.24
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'  # Update to Go 1.24 or higher
-          
-      - name: Install dependencies
+          go-version: '1.24'
+
+      # Step 3: Initialize go.mod if it doesn't exist
+      - name: Initialize go.mod if it doesn't exist
         run: |
           if [ ! -f go.mod ]; then
-            go mod init ${GITHUB_REPOSITORY}  # Automatically initialize go.mod with the repository name
-          fi
-          go get ./...  # Install missing dependencies
-          go mod tidy  # Remove unused dependencies and clean up the module
-
-      - name: Check for module file changes
-        id: git_status
-        run: |
-          if [[ $(git status --porcelain go.mod go.sum) ]]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "go.mod not found. Initializing go.mod..."
+            go mod init ${GITHUB_REPOSITORY}  # Initialize go.mod with the repo name
           fi
 
-      - name: Commit and Push module updates
-        if: steps.git_status.outputs.has_changes == 'true'
+      # Step 4: Install dependencies and tidy go.mod
+      - name: Install dependencies and tidy go.mod
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          git add go.mod go.sum
-          git commit -m "chore: Go module files updated by GitHub Actions [skip ci]"
-          
-          git push
+          go get ./...  # Install dependencies
+          go mod tidy  # Clean up unused dependencies and update go.mod and go.sum
 
-  test:
-    runs-on: ubuntu-latest
-    needs: tidy
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Go 1.24
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
+      # Step 5: Run tests to make sure everything works
       - name: Run tests
         run: |
-          go test -v ./...  # Run the tests to ensure the code is working correctly
+          go test -v ./...  # Run the tests to ensure everything works correctly
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # Optional: Upload the test results as an artifact (for debugging if needed)
+      - name: Upload test results (optional)
+        uses: actions/upload-artifact@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: test-results
+          path: ./test-results  # If you save the results in a file, use this path
 
-      - name: Setup Go 1.24
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
-      - name: Build the Go application
-        run: |
-          go build -o myapp ./app.go  # Build the app.go file in the root of the project
-
-      - name: Deploy the application
-        run: |
-          # Add deployment commands here, such as copying the binary to a server or container
-          echo "Deploying the application..."
-          # Example: scp myapp user@server:/path/to/deploy
