@@ -1,0 +1,17 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Env files (برای اینکه اطلاعات حساس لوکال در ایمیج کپی نشود)
+.env
+.env.local
+
+# Go
+bin/
+vendor/
+*.exe
+*.test
