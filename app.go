@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt" // اضافه شده برای مدیریت ارورها
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -637,8 +638,9 @@ func getMe(c *gin.Context) {
 			iso := user.ExpiryDate.Format(time.RFC3339)
 			expIso = iso
 			if user.ExpiryDate.After(now) {
-				daysLeft = int(user.ExpiryDate.Sub(now).Hours() / 24)
-			}
+                diff := user.ExpiryDate.Sub(now)
+                daysLeft = int(math.Ceil(diff.Hours() / 24))
+            }
 		}
 
 		return gin.H{
