@@ -1,9 +1,10 @@
 package main
 
 import (
-	"container/heap"
+	"bytes"
 	"context"
-	"fmt" // اضافه شده برای مدیریت ارورها
+	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -156,6 +157,29 @@ type Transaction struct {
 	RejectReason string             `bson:"reject_reason,omitempty" json:"reject_reason,omitempty"`
 }
 
+// ----- PaymentOrder model (new) -----
+type PaymentOrder struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	UserID    primitive.ObjectID `bson:"user_id" json:"user_id"`
+	Plan      string             `bson:"plan" json:"plan"`
+	Amount    int64              `bson:"amount" json:"amount"` // ریال
+	Status    string             `bson:"status" json:"status"` // created, pending, paid, failed
+	TrackID   string             `bson:"track_id,omitempty" json:"track_id,omitempty"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	PaidAt    *time.Time         `bson:"paid_at,omitempty" json:"paid_at,omitempty"`
+}
+
+// ----- PLANS (سروری، هاردکد امن) -----
+var Plans = map[string]struct {
+	Days   int
+	Amount int64
+}{
+	"starter": {Days: 30, Amount: 700000},   // 70,000 تومان = 700,000 ریال
+	"pro":     {Days: 90, Amount: 1990000},  // 199,000 تومان
+	"elite":   {Days: 180, Amount: 3990000}, // 399,000 تومان
+	"ultra":   {Days: 365, Amount: 7990000}, // 799,000 تومان
+}
+
 // ----- UTILS -----
 
 func hashPassword(password string) (string, error) {
@@ -267,7 +291,6 @@ func startWorkers(count int) {
 						queueLock.Unlock()
 						continue
 					}
-					// Double check nil or heap issues (safe with standard library but good to be sure)
 					rawItem := heap.Pop(&jobQueue)
 					queueLock.Unlock()
 
@@ -285,7 +308,7 @@ func startWorkers(count int) {
 							code = 500
 						}
 					}
-					
+
 					// Avoid blocking if receiver abandoned channel
 					select {
 					case item.ResultChan <- JobResult{Data: data, Code: code, Err: err}:
@@ -340,7 +363,7 @@ func logicApplyPayment(userIDStr string, couponCode, txHash string, daysReq int)
 			couponColl.DeleteOne(ctx, bson.M{"_id": cp.ID})
 			return map[string]string{"msg": "Coupon limits reached"}, 400, nil
 		}
-		
+
 		// اطمینان از مقداردهی شدن UsedBy برای جلوگیری از پنیک در حلقه
 		if cp.UsedBy == nil {
 			cp.UsedBy = []primitive.ObjectID{}
@@ -355,7 +378,7 @@ func logicApplyPayment(userIDStr string, couponCode, txHash string, daysReq int)
 		// Optimistic locking
 		filter := bson.M{
 			"_id":     cp.ID,
-			"uses":    cp.Uses, 
+			"uses":    cp.Uses,
 			"used_by": bson.M{"$ne": userOID},
 		}
 		update := bson.M{
@@ -506,7 +529,8 @@ func AuthMiddleware(requiredAdmin bool) gin.HandlerFunc {
 		isAdmin := user.Role == "admin"
 		for _, adm := range cfg.AdminUsernames {
 			if adm == username {
-				isAdmin = true; break
+				isAdmin = true
+				break
 			}
 		}
 		if cfg.AdminEnvUser != "" && username == cfg.AdminEnvUser {
@@ -556,9 +580,13 @@ func register(c *gin.Context) {
 
 	role := "user"
 	for _, adm := range cfg.AdminUsernames {
-		if adm == username { role = "admin" }
+		if adm == username {
+			role = "admin"
+		}
 	}
-	if cfg.AdminEnvUser == username { role = "admin" }
+	if cfg.AdminEnvUser == username {
+		role = "admin"
+	}
 
 	newUser := User{
 		Username:    username,
@@ -611,7 +639,7 @@ func getMe(c *gin.Context) {
 		c.JSON(401, gin.H{"msg": "Unauthorized context"})
 		return
 	}
-	
+
 	// Create safe copy for closure
 	currentUser, ok := uVal.(User)
 	if !ok {
@@ -638,9 +666,9 @@ func getMe(c *gin.Context) {
 			iso := user.ExpiryDate.Format(time.RFC3339)
 			expIso = iso
 			if user.ExpiryDate.After(now) {
-                diff := user.ExpiryDate.Sub(now)
-                daysLeft = int(math.Ceil(diff.Hours() / 24))
-            }
+				diff := user.ExpiryDate.Sub(now)
+				daysLeft = int(math.Ceil(diff.Hours() / 24))
+			}
 		}
 
 		return gin.H{
@@ -672,7 +700,7 @@ func submitPayment(c *gin.Context) {
 		TxHash     string `json:"tx_hash"`
 		CouponCode string `json:"coupon_code"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(400, gin.H{"msg": "Invalid JSON"})
 		return
@@ -680,8 +708,10 @@ func submitPayment(c *gin.Context) {
 
 	// Logic inputs
 	days := 0
-	if body.Days != nil { days = *body.Days }
-	
+	if body.Days != nil {
+		days = *body.Days
+	}
+
 	if body.CouponCode == "" && (days < 1 || days > 3650) {
 		c.JSON(400, gin.H{"msg": "Days required (1-3650) if no coupon"})
 		return
@@ -734,7 +764,9 @@ func adminListTx(c *gin.Context) {
 
 	output := []gin.H{}
 	// Make sure slice is not nil for safety
-	if rawResults == nil { rawResults = []Transaction{} }
+	if rawResults == nil {
+		rawResults = []Transaction{}
+	}
 
 	for _, tx := range rawResults {
 		item := gin.H{
@@ -767,7 +799,7 @@ func adminApproveTx(c *gin.Context) {
 	admin, ok := uVal.(User)
 	if !ok {
 		c.JSON(401, gin.H{"msg": "Auth Error"})
-		return 
+		return
 	}
 
 	task := func() (interface{}, int, error) {
@@ -821,19 +853,23 @@ func adminRejectTx(c *gin.Context) {
 	uVal, _ := c.Get("user")
 	admin := uVal.(User)
 
-	var body struct { Reason string `json:"reason"` }
+	var body struct{ Reason string `json:"reason"` }
 	// ShouldBind can leave fields empty, manual init check logic:
 	if err := c.ShouldBindJSON(&body); err != nil {
 		// Just continue if body empty or invalid
 	}
-	if body.Reason == "" { body.Reason = "No reason" }
+	if body.Reason == "" {
+		body.Reason = "No reason"
+	}
 
 	task := func() (interface{}, int, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		oid, err := primitive.ObjectIDFromHex(txID)
-		if err != nil { return map[string]string{"msg": "ID error"}, 400, nil }
+		if err != nil {
+			return map[string]string{"msg": "ID error"}, 400, nil
+		}
 
 		res, err := db.Collection("transactions").UpdateOne(ctx,
 			bson.M{"_id": oid, "status": "pending"},
@@ -866,7 +902,7 @@ func manageCoupons(c *gin.Context) {
 		}
 		var coupons []Coupon
 		// IMPORTANT: Initialize to empty slice so JSON returns [] not null
-		coupons = []Coupon{} 
+		coupons = []Coupon{}
 		cursor.All(ctx, &coupons)
 
 		output := []gin.H{}
@@ -929,6 +965,320 @@ func manageCoupons(c *gin.Context) {
 	c.JSON(201, gin.H{"msg": "Coupon created"})
 }
 
+// ----- ZIBAL (Gateway) helper -----
+
+func zibalPost(path string, payload interface{}) (map[string]interface{}, error) {
+	base := os.Getenv("ZIBAL_GATEWAY_BASE")
+	if base == "" {
+		base = "https://gateway.zibal.ir"
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", base+"/"+path, bytes.NewBuffer(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var m map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func requestResult(result string) string {
+	switch result {
+	case "100":
+		return "با موفقیت تایید شد."
+	case "102":
+		return "merchant یافت نشد."
+	case "103":
+		return "merchant غیرفعال است."
+	case "104":
+		return "merchant نامعتبر است."
+	case "201":
+		return "قبلا تایید شده."
+	case "105":
+		return "amount باید بزرگتر از 1,000 ریال باشد."
+	case "106":
+		return "callbackUrl نامعتبر است."
+	case "113":
+		return "مبلغ تراکنش از سقف مجاز بیشتر است."
+	}
+	return "خطا در درخواست پرداخت"
+}
+
+func verifyResult(result string) string {
+	switch result {
+	case "100":
+		return "با موفقیت تایید شد."
+	case "102":
+		return "merchant یافت نشد."
+	case "103":
+		return "merchant غیر فعال"
+	case "104":
+		return "merchant نامعتبر"
+	case "201":
+		return "قبلا تایید شده."
+	case "202":
+		return "سفارش پرداخت نشده یا ناموفق بوده است."
+	case "203":
+		return "trackId نامعتبر است."
+	}
+	return "خطا در تایید پرداخت"
+}
+
+// ----- Payment endpoints (create + callback) -----
+
+// POST /payment/create
+// body: { "plan": "starter" }
+func createPayment(c *gin.Context) {
+	uVal, _ := c.Get("user")
+	user := uVal.(User)
+
+	var body struct {
+		Plan string `json:"plan"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"msg": "Invalid request"})
+		return
+	}
+
+	plan, ok := Plans[body.Plan]
+	if !ok {
+		c.JSON(400, gin.H{"msg": "Invalid plan"})
+		return
+	}
+
+	merchant := os.Getenv("ZIBAL_MERCHANT")
+	callback := os.Getenv("ZIBAL_CALLBACK_URL")
+	if merchant == "" || callback == "" {
+		log.Println("ZIBAL envs missing")
+		c.JSON(500, gin.H{"msg": "Payment gateway not configured"})
+		return
+	}
+
+	// create payment order in DB first (server-of-truth)
+	order := PaymentOrder{
+		UserID:    user.ID,
+		Plan:      body.Plan,
+		Amount:    plan.Amount,
+		Status:    "created",
+		CreatedAt: time.Now().UTC(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	res, err := db.Collection("payment_orders").InsertOne(ctx, order)
+	if err != nil {
+		log.Printf("insert payment order error: %v", err)
+		c.JSON(500, gin.H{"msg": "DB error"})
+		return
+	}
+
+	oid, ok := res.InsertedID.(primitive.ObjectID)
+	if !ok {
+		log.Println("inserted id not objectid")
+		c.JSON(500, gin.H{"msg": "DB error"})
+		return
+	}
+
+	// request to gateway (amount must be in ریال)
+	payload := map[string]interface{}{
+		"merchant":    merchant,
+		"amount":      plan.Amount,
+		"callbackUrl": callback,
+		"description": "TwoManga Plan: " + body.Plan,
+	}
+
+	resp, err := zibalPost("v1/request", payload)
+	if err != nil {
+		log.Printf("zibal request error: %v", err)
+		c.JSON(502, gin.H{"msg": "Gateway error"})
+		// Consider marking payment_orders[oid] as failed or manual retry
+		return
+	}
+
+	if fmt.Sprint(resp["result"]) != "100" {
+		msg := requestResult(fmt.Sprint(resp["result"]))
+		log.Printf("zibal returned error: %v", resp)
+		// update order status
+		db.Collection("payment_orders").UpdateOne(context.Background(), bson.M{"_id": oid}, bson.M{
+			"$set": bson.M{"status": "failed", "created_at": order.CreatedAt},
+			"$push": bson.M{"zibal_error": resp},
+		})
+		c.JSON(400, gin.H{"msg": "Payment gateway rejected", "detail": msg})
+		return
+	}
+
+	trackID := fmt.Sprint(resp["trackId"])
+	if trackID == "" {
+		log.Printf("zibal returned no trackId: %v", resp)
+		c.JSON(500, gin.H{"msg": "Gateway returned no trackId"})
+		return
+	}
+
+	// store track id and set pending
+	_, err = db.Collection("payment_orders").UpdateOne(context.Background(),
+		bson.M{"_id": oid},
+		bson.M{"$set": bson.M{"track_id": trackID, "status": "pending"}})
+	if err != nil {
+		log.Printf("update payment order with track failed: %v", err)
+		// still return redirect so user can try to pay; admin should reconcile
+	}
+
+	// redirect url to send to client
+	redirectURL := os.Getenv("ZIBAL_GATEWAY_BASE")
+	if redirectURL == "" {
+		redirectURL = "https://gateway.zibal.ir"
+	}
+	c.JSON(200, gin.H{
+		"redirect_url": redirectURL + "/start/" + trackID,
+		"track_id":     trackID,
+		"order_id":     oid.Hex(),
+	})
+}
+
+// GET /payment/callback?trackId=...  (زیبال کاربر رو به این آدرس هدایت می‌کنه بعد از پرداخت)
+func paymentCallback(c *gin.Context) {
+	trackID := c.Query("trackId")
+	if trackID == "" {
+		c.JSON(400, gin.H{"msg": "Missing trackId"})
+		return
+	}
+
+	merchant := os.Getenv("ZIBAL_MERCHANT")
+	if merchant == "" {
+		c.JSON(500, gin.H{"msg": "Gateway not configured"})
+		return
+	}
+
+	// verify with gateway (truth source)
+	payload := map[string]interface{}{
+		"merchant": merchant,
+		"trackId":  trackID,
+	}
+	resp, err := zibalPost("v1/verify", payload)
+	if err != nil {
+		log.Printf("zibal verify error: %v", err)
+		c.JSON(502, gin.H{"msg": "Gateway verify error"})
+		return
+	}
+
+	result := fmt.Sprint(resp["result"])
+	if result != "100" {
+		msg := verifyResult(result)
+		log.Printf("zibal verify not success: %v - %v", result, resp)
+		// try to mark order failed if exists
+		db.Collection("payment_orders").UpdateOne(context.Background(), bson.M{"track_id": trackID},
+			bson.M{"$set": bson.M{"status": "failed", "zibal_verify": resp}})
+		c.JSON(400, gin.H{"msg": "Payment not verified", "detail": msg})
+		return
+	}
+
+	// find order by track_id
+	var order PaymentOrder
+	err = db.Collection("payment_orders").FindOne(context.Background(), bson.M{"track_id": trackID}).Decode(&order)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			log.Printf("order not found for track: %s", trackID)
+			c.JSON(404, gin.H{"msg": "Order not found - contact support"})
+			return
+		}
+		log.Printf("db error finding order by track: %v", err)
+		c.JSON(500, gin.H{"msg": "DB error"})
+		return
+	}
+
+	// idempotency: if already paid
+	if order.Status == "paid" {
+		c.JSON(200, gin.H{"msg": "Already paid"})
+		return
+	}
+
+	// extract amount returned (if any) and validate
+	amountReturned := int64(0)
+	if a, ok := resp["amount"]; ok {
+		switch v := a.(type) {
+		case float64:
+			amountReturned = int64(v)
+		case json.Number:
+			if ai, err := v.Int64(); err == nil {
+				amountReturned = ai
+			}
+		case string:
+			if ai, err := strconv.ParseInt(v, 10, 64); err == nil {
+				amountReturned = ai
+			}
+		}
+	}
+
+	// verify amount matches server plan amount
+	if amountReturned != 0 && amountReturned != order.Amount {
+		log.Printf("amount mismatch for order %s: returned=%d expected=%d", order.ID.Hex(), amountReturned, order.Amount)
+		db.Collection("payment_orders").UpdateOne(context.Background(), bson.M{"_id": order.ID},
+			bson.M{"$set": bson.M{"status": "failed", "zibal_verify": resp}})
+		c.JSON(400, gin.H{"msg": "Amount mismatch - contact support"})
+		return
+	}
+
+	// update user expiry and order status atomically-ish (best effort)
+	var user User
+	if err := db.Collection("users").FindOne(context.Background(), bson.M{"_id": order.UserID}).Decode(&user); err != nil {
+		log.Printf("user not found when finalizing payment: %v", err)
+		c.JSON(500, gin.H{"msg": "User not found"})
+		return
+	}
+
+	now := time.Now().UTC()
+	start := now
+	if user.ExpiryDate != nil && user.ExpiryDate.After(now) {
+		start = *user.ExpiryDate
+	}
+
+	plan, ok := Plans[order.Plan]
+	if !ok {
+		// unexpected — but handle gracefully
+		log.Printf("unknown plan %s for order %s", order.Plan, order.ID.Hex())
+		plan = struct {
+			Days   int
+			Amount int64
+		}{Days: 30, Amount: order.Amount}
+	}
+
+	newExp := start.Add(time.Duration(plan.Days) * 24 * time.Hour)
+
+	// Apply updates
+	_, err = db.Collection("users").UpdateOne(context.Background(), bson.M{"_id": user.ID}, bson.M{
+		"$set": bson.M{"expiryDate": newExp},
+		"$inc": bson.M{"total_purchases": 1},
+	})
+	if err != nil {
+		log.Printf("failed to update user expiry after payment: %v", err)
+		c.JSON(500, gin.H{"msg": "Failed to update user"})
+		return
+	}
+
+	_, err = db.Collection("payment_orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{
+		"$set": bson.M{"status": "paid", "paid_at": now, "zibal_verify": resp},
+	})
+	if err != nil {
+		log.Printf("failed to update payment order as paid: %v", err)
+		// Not fatal for user; but admin reconciliation may be needed
+	}
+
+	c.JSON(200, gin.H{
+		"msg":        "Payment successful",
+		"new_expiry": newExp.Format(time.RFC3339),
+	})
+}
+
 // ----- STARTUP -----
 
 func ensureIndexesAndAdmin() {
@@ -952,6 +1302,11 @@ func ensureIndexesAndAdmin() {
 	db.Collection("coupons").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "code", Value: 1}},
 		Options: options.Index().SetUnique(true),
+	})
+	// payment_orders index for fast lookup by track_id
+	db.Collection("payment_orders").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "track_id", Value: 1}},
+		Options: options.Index().SetUnique(true).SetSparse(true),
 	})
 
 	// Bootstrap Admin
@@ -1004,7 +1359,7 @@ func main() {
 
 	// Heap must be initialized
 	heap.Init(&jobQueue)
-	
+
 	// Start workers after DB and Heap are ready
 	startWorkers(cfg.WorkerCount)
 
@@ -1034,9 +1389,9 @@ func main() {
 	// Routes
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
-			"service":        "TwoManga API",
-			"status":         "healthy",
-			"workers":        cfg.WorkerCount,
+			"service": "TwoManga API",
+			"status":  "healthy",
+			"workers": cfg.WorkerCount,
 		})
 	})
 
@@ -1051,7 +1406,10 @@ func main() {
 	payment.Use(AuthMiddleware(false))
 	{
 		payment.POST("/submit", submitPayment)
+		payment.POST("/create", createPayment) // <-- new endpoint to start gateway flow
 	}
+	// public gateway callback (should be registered exact in Zibal panel)
+	r.GET("/payment/callback", paymentCallback) // <-- Zibal will call this (or redirect user)
 
 	admin := r.Group("/admin")
 	admin.Use(AuthMiddleware(true))
@@ -1087,11 +1445,11 @@ func main() {
 	// 2. Stop Web Server
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Println("Server Shutdown Force:", err)
 	}
-	
+
 	// 3. Close DB
 	if mongoClient != nil {
 		mongoClient.Disconnect(context.Background())
